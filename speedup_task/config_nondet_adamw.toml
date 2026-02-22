@@ -1,0 +1,46 @@
+[general]
+model_version = "klein-base-9b"
+dit = "/workspace/models/flux-2-klein-base-9b.safetensors"
+vae = "/workspace/models/ae.safetensors"
+text_encoder = "/workspace/models/model-00001-of-00004.safetensors"
+dataset_config = "/workspace/dataset.toml"
+flash_attn = true
+weighting_scheme = "none"
+mixed_precision = "bf16"
+optimizer_type = "AdamW"
+learning_rate = 1e-4
+lr_scheduler = "constant"
+optimizer_args = ["weight_decay=0.0"]
+gradient_checkpointing = true
+max_data_loader_n_workers = 0
+persistent_data_loader_workers = false
+network_module = "networks.lora_flux_2"
+network_dim = 32
+network_alpha = 32
+max_train_epochs = 13
+seed = 420
+output_dir = "/workspace/output/"
+output_name = "diamel"
+blocks_to_swap = 0
+sample_every_n_epochs = 1
+sample_prompts = "/workspace/prompts.txt"
+max_grad_norm = 0.0
+use_pinned_memory_for_block_swap = true
+
+[logging]
+logging_dir = "/workspace/logs/"
+log_with = "tensorboard"
+
+[saves]
+save_last_n_epochs_state = 2
+save_every_n_epochs = 1
+save_state = true
+
+[fp8]
+fp8_base = false
+fp8_scaled = false
+
+[timestamps]
+preserve_distribution_shape = true
+max_timestep = 900
+timestep_sampling = "qinglong_flux"

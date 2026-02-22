@@ -4,6 +4,7 @@ from datetime import timedelta
 import gc
 import importlib
 import argparse
+import hashlib
 import math
 import os
 import pathlib
@@ -12,6 +13,7 @@ import sys
 import random
 import time
 import json
+from collections import Counter
 from multiprocessing import Value
 from typing import Any, Dict, List, Optional
 import accelerate
@@ -68,6 +70,77 @@ SS_METADATA_MINIMUM_KEYS = [
     SS_METADATA_KEY_NETWORK_ALPHA,
     SS_METADATA_KEY_NETWORK_ARGS,
 ]
+
+
+def _sha256_of_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _build_file_manifest(root_dir: str) -> dict[str, dict[str, Any]]:
+    manifest: dict[str, dict[str, Any]] = {}
+    for current_root, _, files in os.walk(root_dir):
+        files.sort()
+        for file_name in files:
+            path = os.path.join(current_root, file_name)
+            rel_path = os.path.relpath(path, root_dir)
+            manifest[rel_path] = {
+                "size": os.path.getsize(path),
+                "sha256": _sha256_of_file(path),
+            }
+    return manifest
+
+
+def _tensor_sha256(tensor: torch.Tensor) -> str:
+    data = tensor.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
+    return hashlib.sha256(data).hexdigest()
+
+
+def _summarize_optimizer_state(optimizer: torch.optim.Optimizer) -> dict[str, Any]:
+    state_dict = optimizer.state_dict()
+    state_items = state_dict.get("state", {})
+    key_counter: Counter = Counter()
+    dtype_numel: Counter = Counter()
+    tensor_count = 0
+    total_numel = 0
+
+    def scan(value):
+        nonlocal tensor_count
+        nonlocal total_numel
+
+        if torch.is_tensor(value):
+            tensor_count += 1
+            numel = int(value.numel())
+            total_numel += numel
+            dtype_numel[str(value.dtype)] += numel
+            return
+        if isinstance(value, dict):
+            for nested_key, nested_val in value.items():
+                key_counter[str(nested_key)] += 1
+                scan(nested_val)
+            return
+        if isinstance(value, (list, tuple)):
+            for nested_val in value:
+                scan(nested_val)
+
+    for per_param_state in state_items.values():
+        scan(per_param_state)
+
+    return {
+        "optimizer_class": optimizer.__class__.__name__,
+        "num_param_groups": len(state_dict.get("param_groups", [])),
+        "num_state_entries": len(state_items),
+        "num_state_tensors": tensor_count,
+        "num_state_numel": total_numel,
+        "dtype_numel": dict(dtype_numel),
+        "state_key_frequency": dict(key_counter),
+    }
 
 
 def clean_memory_on_device(device: torch.device):
@@ -1677,6 +1750,30 @@ class NetworkTrainer:
             self.show_timesteps(args)
             return
 
+        profiling_run_enabled = args.profile_capture_step is not None or args.profile_stop_step is not None
+        if profiling_run_enabled:
+            if args.profile_capture_step is None or args.profile_stop_step is None:
+                raise ValueError(
+                    "--profile_capture_step and --profile_stop_step must be specified together / "
+                    "--profile_capture_stepと--profile_stop_stepはセットで指定してください"
+                )
+            if args.profile_capture_step < 1 or args.profile_stop_step < 1:
+                raise ValueError(
+                    "--profile_capture_step and --profile_stop_step must be >= 1 / "
+                    "--profile_capture_stepと--profile_stop_stepは1以上で指定してください"
+                )
+            if args.profile_capture_step > args.profile_stop_step:
+                raise ValueError(
+                    "--profile_capture_step must be <= --profile_stop_step / "
+                    "--profile_capture_stepは--profile_stop_step以下で指定してください"
+                )
+            if args.profile_disable_sampling:
+                args.sample_at_first = False
+                args.sample_every_n_steps = None
+                args.sample_every_n_epochs = None
+                args.sample_prompts = None
+                logger.info("Profiling mode: sample generation is forcibly disabled / プロファイル実行のためサンプル生成を無効化しました")
+
         session_id = random.randint(0, 2**32)
         training_started_at = time.time()
         # setup_logging(args, reset=True)
@@ -1883,6 +1980,14 @@ class NetworkTrainer:
             accelerator.print(
                 f"override steps. steps for {args.max_train_epochs} epochs is / 指定エポックまでのステップ数: {args.max_train_steps}"
             )
+
+        if args.profile_stop_step is not None and args.profile_stop_step < args.max_train_steps:
+            accelerator.print(
+                "profiling: override max_train_steps "
+                f"from {args.max_train_steps} to {args.profile_stop_step} / "
+                f"プロファイル実行のためmax_train_stepsを{args.max_train_steps}から{args.profile_stop_step}に変更"
+            )
+            args.max_train_steps = args.profile_stop_step
 
         # send max_train_steps to train_dataset_group
         train_dataset_group.set_max_train_steps(args.max_train_steps)
@@ -2107,6 +2212,7 @@ class NetworkTrainer:
         def save_model(ckpt_name: str, unwrapped_nw, steps, epoch_no, force_sync_upload=False):
             os.makedirs(args.output_dir, exist_ok=True)
             ckpt_file = os.path.join(args.output_dir, ckpt_name)
+            os.makedirs(os.path.dirname(ckpt_file), exist_ok=True)
 
             accelerator.print(f"\nsaving checkpoint: {ckpt_file}")
             metadata["ss_training_finished_at"] = str(time.time())
@@ -2149,6 +2255,161 @@ class NetworkTrainer:
                 accelerator.print(f"removing old checkpoint: {old_ckpt_file}")
                 os.remove(old_ckpt_file)
 
+        profile_capture_step = args.profile_capture_step
+        profile_stop_step = args.profile_stop_step
+        profile_single_step_started = False
+        profile_single_step_finished = False
+        profile_stop_artifacts_saved = False
+        torch_profiler = None
+        torch_profiler_active = False
+        cuda_profiler_active = False
+        profile_run_dir = None
+
+        if profile_capture_step is not None:
+            profile_root = args.profile_artifacts_dir or os.path.join(args.output_dir if args.output_dir else ".", "profile_artifacts")
+            profile_run_name = (
+                f"{time.strftime('%Y%m%d%H%M%S', time.localtime())}_capture{profile_capture_step:08d}_stop{profile_stop_step:08d}"
+            )
+            profile_run_dir = os.path.join(profile_root, profile_run_name)
+            if is_main_process:
+                os.makedirs(profile_run_dir, exist_ok=True)
+            accelerator.wait_for_everyone()
+            accelerator.print(f"profiling artifacts directory: {profile_run_dir}")
+
+        def start_single_step_profiling():
+            nonlocal profile_single_step_started
+            nonlocal torch_profiler
+            nonlocal torch_profiler_active
+            nonlocal cuda_profiler_active
+
+            if profile_single_step_started:
+                return
+            profile_single_step_started = True
+
+            if args.profile_with_torch:
+                activities = [torch.profiler.ProfilerActivity.CPU]
+                if torch.cuda.is_available():
+                    activities.append(torch.profiler.ProfilerActivity.CUDA)
+                torch_profiler = torch.profiler.profile(
+                    activities=activities,
+                    record_shapes=True,
+                    profile_memory=True,
+                    with_stack=True,
+                )
+                torch_profiler.start()
+                torch_profiler_active = True
+                accelerator.print(f"torch.profiler started at step {profile_capture_step}")
+
+            if args.profile_with_cuda_profiler_api:
+                if torch.cuda.is_available():
+                    result = torch.cuda.cudart().cudaProfilerStart()
+                    if result != 0:
+                        logger.warning(f"cudaProfilerStart failed with code {result}")
+                    else:
+                        cuda_profiler_active = True
+                        accelerator.print(f"cudaProfilerStart called at step {profile_capture_step}")
+                else:
+                    logger.warning("cudaProfilerStart requested but CUDA is not available")
+
+        def stop_single_step_profiling(step_no: int):
+            nonlocal profile_single_step_finished
+            nonlocal torch_profiler
+            nonlocal torch_profiler_active
+            nonlocal cuda_profiler_active
+
+            if profile_single_step_finished:
+                return
+
+            if torch_profiler_active and torch_profiler is not None:
+                torch_profiler.step()
+                torch_profiler.stop()
+
+                if profile_run_dir is not None:
+                    rank_dir = os.path.join(profile_run_dir, "torch_profiler", f"rank{accelerator.process_index:02d}")
+                    os.makedirs(rank_dir, exist_ok=True)
+                    chrome_trace_file = os.path.join(rank_dir, f"step{step_no:08d}.json")
+                    summary_file = os.path.join(rank_dir, f"step{step_no:08d}.txt")
+                    torch_profiler.export_chrome_trace(chrome_trace_file)
+                    sort_key = "self_cuda_time_total" if torch.cuda.is_available() else "self_cpu_time_total"
+                    with open(summary_file, "w", encoding="utf-8") as f:
+                        f.write(torch_profiler.key_averages().table(sort_by=sort_key, row_limit=200))
+                torch_profiler = None
+                torch_profiler_active = False
+                accelerator.print(f"torch.profiler stopped at step {step_no}")
+
+            if cuda_profiler_active:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    result = torch.cuda.cudart().cudaProfilerStop()
+                    if result != 0:
+                        logger.warning(f"cudaProfilerStop failed with code {result}")
+                    else:
+                        accelerator.print(f"cudaProfilerStop called at step {step_no}")
+                cuda_profiler_active = False
+
+            profile_single_step_finished = True
+
+        def save_profile_stop_artifacts(step_no: int, epoch_no: int, current_loss: float, avr_loss: float):
+            nonlocal profile_stop_artifacts_saved
+
+            if profile_stop_artifacts_saved or profile_run_dir is None:
+                return
+
+            profile_stop_artifacts_saved = True
+            stop_dir = os.path.join(profile_run_dir, f"stop_step_{step_no:08d}")
+
+            if is_main_process:
+                os.makedirs(stop_dir, exist_ok=True)
+
+                result_summary = {
+                    "profile_capture_step": profile_capture_step,
+                    "profile_stop_step": profile_stop_step,
+                    "global_step": step_no,
+                    "epoch": epoch_no + 1,
+                    "current_loss": current_loss,
+                    "moving_average_loss": avr_loss,
+                    "learning_rates": [group["lr"] for group in optimizer.param_groups],
+                    "seed": args.seed,
+                    "optimizer_class": optimizer.__class__.__name__,
+                    "rng_state_hashes": {
+                        "torch_cpu": _tensor_sha256(torch.get_rng_state()),
+                    },
+                }
+                if torch.cuda.is_available():
+                    result_summary["rng_state_hashes"]["torch_cuda"] = [
+                        _tensor_sha256(cuda_state) for cuda_state in torch.cuda.get_rng_state_all()
+                    ]
+
+                if args.profile_save_optimizer_summary_on_stop:
+                    result_summary["optimizer_state_summary"] = _summarize_optimizer_state(optimizer)
+
+                if args.profile_save_model_on_stop:
+                    profile_model_file = os.path.join(stop_dir, f"{args.output_name}-step{step_no:08d}.safetensors")
+                    profile_metadata = dict(minimum_metadata if args.no_metadata else metadata)
+                    profile_metadata["ss_training_finished_at"] = str(time.time())
+                    profile_metadata["ss_steps"] = str(step_no)
+                    profile_metadata["ss_epoch"] = str(epoch_no + 1)
+                    accelerator.unwrap_model(network).save_weights(profile_model_file, save_dtype, profile_metadata)
+                    result_summary["profile_model_file"] = profile_model_file
+
+                if args.profile_save_state_on_stop:
+                    profile_state_dir = os.path.join(stop_dir, "accelerate_state")
+                    accelerator.save_state(profile_state_dir)
+                    result_summary["profile_state_dir"] = profile_state_dir
+
+                summary_path = os.path.join(stop_dir, "run_result.json")
+                with open(summary_path, "w", encoding="utf-8") as f:
+                    json.dump(result_summary, f, indent=2, ensure_ascii=False)
+
+                manifest = _build_file_manifest(stop_dir)
+                manifest_path = os.path.join(stop_dir, "artifact_manifest.json")
+                with open(manifest_path, "w", encoding="utf-8") as f:
+                    json.dump(manifest, f, indent=2, ensure_ascii=False)
+
+                accelerator.print(f"saved profiling stop artifacts: {stop_dir}")
+
+            accelerator.wait_for_everyone()
+
         # For --sample_at_first
         if should_sample_images(args, global_step, epoch=0):
             optimizer_eval_fn()
@@ -2185,51 +2446,70 @@ class NetworkTrainer:
                 latents = batch["latents"]
 
                 with accelerator.accumulate(training_model):
+                    if (
+                        profile_capture_step is not None
+                        and not profile_single_step_started
+                        and accelerator.sync_gradients
+                        and (global_step + 1) == profile_capture_step
+                    ):
+                        start_single_step_profiling()
+
                     accelerator.unwrap_model(network).on_step_start()
 
-                    latents = self.scale_shift_latents(latents)
+                    with torch.autograd.profiler.record_function("train/batch_prep"):
+                        latents = self.scale_shift_latents(latents)
+                        # Sample noise that we'll add to the latents
+                        noise = torch.randn_like(latents)
 
-                    # Sample noise that we'll add to the latents
-                    noise = torch.randn_like(latents)
+                    with torch.autograd.profiler.record_function("train/timestep_sampling_and_noisy_input"):
+                        # calculate model input and timesteps
+                        noisy_model_input, timesteps = self.get_noisy_model_input_and_timesteps(
+                            args, noise, latents, batch["timesteps"], noise_scheduler, accelerator.device, dit_dtype
+                        )
 
-                    # calculate model input and timesteps
-                    noisy_model_input, timesteps = self.get_noisy_model_input_and_timesteps(
-                        args, noise, latents, batch["timesteps"], noise_scheduler, accelerator.device, dit_dtype
-                    )
+                    with torch.autograd.profiler.record_function("train/loss_weighting"):
+                        weighting = compute_loss_weighting_for_sd3(
+                            args.weighting_scheme, noise_scheduler, timesteps, accelerator.device, dit_dtype
+                        )
 
-                    weighting = compute_loss_weighting_for_sd3(
-                        args.weighting_scheme, noise_scheduler, timesteps, accelerator.device, dit_dtype
-                    )
+                    with torch.autograd.profiler.record_function("train/dit_forward"):
+                        model_pred, target = self.call_dit(
+                            args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype
+                        )
 
-                    model_pred, target = self.call_dit(
-                        args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype
-                    )
-                    loss = torch.nn.functional.mse_loss(model_pred.to(network_dtype), target, reduction="none")
+                    with torch.autograd.profiler.record_function("train/loss_compute"):
+                        loss = torch.nn.functional.mse_loss(model_pred.to(network_dtype), target, reduction="none")
 
-                    if weighting is not None:
-                        loss = loss * weighting
-                    # loss = loss.mean([1, 2, 3])
-                    # # min snr gamma, scale v pred loss like noise pred, v pred like loss, debiased estimation etc.
-                    # loss = self.post_process_loss(loss, args, timesteps, noise_scheduler)
+                        if weighting is not None:
+                            loss = loss * weighting
+                        # loss = loss.mean([1, 2, 3])
+                        # # min snr gamma, scale v pred loss like noise pred, v pred like loss, debiased estimation etc.
+                        # loss = self.post_process_loss(loss, args, timesteps, noise_scheduler)
 
-                    loss = loss.mean()  # mean loss over all elements in batch
+                        loss = loss.mean()  # mean loss over all elements in batch
 
-                    accelerator.backward(loss)
+                    with torch.autograd.profiler.record_function("train/backward"):
+                        accelerator.backward(loss)
+
                     if accelerator.sync_gradients:
-                        # self.all_reduce_network(accelerator, network)  # sync DDP grad manually
-                        state = accelerate.PartialState()
-                        if state.distributed_type != accelerate.DistributedType.NO:
-                            for param in network.parameters():
-                                if param.grad is not None:
-                                    param.grad = accelerator.reduce(param.grad, reduction="mean")
+                        with torch.autograd.profiler.record_function("train/grad_sync_and_clip"):
+                            # self.all_reduce_network(accelerator, network)  # sync DDP grad manually
+                            state = accelerate.PartialState()
+                            if state.distributed_type != accelerate.DistributedType.NO:
+                                for param in network.parameters():
+                                    if param.grad is not None:
+                                        param.grad = accelerator.reduce(param.grad, reduction="mean")
 
-                        if args.max_grad_norm != 0.0:
-                            params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
-                            accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                            if args.max_grad_norm != 0.0:
+                                params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
+                                accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
-                    optimizer.step()
-                    lr_scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
+                    with torch.autograd.profiler.record_function("train/optimizer_step"):
+                        optimizer.step()
+                    with torch.autograd.profiler.record_function("train/lr_scheduler_step"):
+                        lr_scheduler.step()
+                    with torch.autograd.profiler.record_function("train/optimizer_zero_grad"):
+                        optimizer.zero_grad(set_to_none=True)
 
                 if args.scale_weight_norms:
                     keys_scaled, mean_norm, maximum_norm = accelerator.unwrap_model(network).apply_max_norm_regularization(
@@ -2246,44 +2526,57 @@ class NetworkTrainer:
                     progress_bar.update(1)
                     global_step += 1
 
-                    # to avoid calling optimizer_eval_fn() too frequently, we call it only when we need to sample images or save the model
-                    should_sampling = should_sample_images(args, global_step, epoch=None)
-                    should_saving = args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0
+                    if (
+                        profile_capture_step is not None
+                        and not profile_single_step_finished
+                        and profile_single_step_started
+                        and global_step == profile_capture_step
+                    ):
+                        stop_single_step_profiling(global_step)
 
-                    if should_sampling or should_saving:
-                        optimizer_eval_fn()
-                        if should_sampling:
-                            self.sample_images(accelerator, args, None, global_step, vae, transformer, sample_parameters, dit_dtype)
+                    with torch.autograd.profiler.record_function("train/sampling_and_checkpoint_hooks"):
+                        # to avoid calling optimizer_eval_fn() too frequently, we call it only when we need to sample images or save the model
+                        should_sampling = should_sample_images(args, global_step, epoch=None)
+                        should_saving = args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0
 
-                        if should_saving:
-                            accelerator.wait_for_everyone()
-                            if accelerator.is_main_process:
-                                ckpt_name = train_utils.get_step_ckpt_name(args.output_name, global_step)
-                                save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch)
+                        if should_sampling or should_saving:
+                            optimizer_eval_fn()
+                            if should_sampling:
+                                self.sample_images(accelerator, args, None, global_step, vae, transformer, sample_parameters, dit_dtype)
 
-                                if args.save_state:
-                                    train_utils.save_and_remove_state_stepwise(args, accelerator, global_step)
+                            if should_saving:
+                                accelerator.wait_for_everyone()
+                                if accelerator.is_main_process:
+                                    ckpt_name = train_utils.get_step_ckpt_name(args.output_name, global_step)
+                                    save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch)
 
-                                remove_step_no = train_utils.get_remove_step_no(args, global_step)
-                                if remove_step_no is not None:
-                                    remove_ckpt_name = train_utils.get_step_ckpt_name(args.output_name, remove_step_no)
-                                    remove_model(remove_ckpt_name)
-                        optimizer_train_fn()
+                                    if args.save_state:
+                                        train_utils.save_and_remove_state_stepwise(args, accelerator, global_step)
 
-                current_loss = loss.detach().item()
-                loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
-                avr_loss: float = loss_recorder.moving_average
-                logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
-                progress_bar.set_postfix(**logs)
+                                    remove_step_no = train_utils.get_remove_step_no(args, global_step)
+                                    if remove_step_no is not None:
+                                        remove_ckpt_name = train_utils.get_step_ckpt_name(args.output_name, remove_step_no)
+                                        remove_model(remove_ckpt_name)
+                            optimizer_train_fn()
 
-                if args.scale_weight_norms:
-                    progress_bar.set_postfix(**{**max_mean_logs, **logs})
+                with torch.autograd.profiler.record_function("train/step_logging"):
+                    current_loss = loss.detach().item()
+                    loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
+                    avr_loss: float = loss_recorder.moving_average
+                    logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
+                    progress_bar.set_postfix(**logs)
 
-                if len(accelerator.trackers) > 0:
-                    logs = self.generate_step_logs(
-                        args, current_loss, avr_loss, lr_scheduler, lr_descriptions, optimizer, keys_scaled, mean_norm, maximum_norm
-                    )
-                    accelerator.log(logs, step=global_step)
+                    if args.scale_weight_norms:
+                        progress_bar.set_postfix(**{**max_mean_logs, **logs})
+
+                    if len(accelerator.trackers) > 0:
+                        logs = self.generate_step_logs(
+                            args, current_loss, avr_loss, lr_scheduler, lr_descriptions, optimizer, keys_scaled, mean_norm, maximum_norm
+                        )
+                        accelerator.log(logs, step=global_step)
+
+                if profile_stop_step is not None and global_step == profile_stop_step:
+                    save_profile_stop_artifacts(global_step, epoch, current_loss, avr_loss)
 
                 if global_step >= args.max_train_steps:
                     break
@@ -2314,6 +2607,18 @@ class NetworkTrainer:
             optimizer_train_fn()
 
             # end of epoch
+
+        if profile_capture_step is not None and profile_single_step_started and not profile_single_step_finished:
+            stop_single_step_profiling(global_step)
+
+        if profile_capture_step is not None and not profile_single_step_started:
+            logger.warning(
+                f"profiling capture step {profile_capture_step} was not reached; max global step was {global_step}"
+            )
+        if profile_stop_step is not None and not profile_stop_artifacts_saved:
+            logger.warning(
+                f"profile stop artifacts were not saved because stop step {profile_stop_step} was not reached (global step {global_step})"
+            )
 
         # metadata["ss_epoch"] = str(num_train_epochs)
         metadata["ss_training_finished_at"] = str(time.time())
@@ -2567,6 +2872,55 @@ def setup_parser_common() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="file for prompts to generate sample images / 学習中モデルのサンプル出力用プロンプトのファイル",
+    )
+
+    parser.add_argument(
+        "--profile_capture_step",
+        type=int,
+        default=None,
+        help="capture exactly one optimization step with profiler at this global step / 指定したglobal stepの1ステップだけをプロファイルする",
+    )
+    parser.add_argument(
+        "--profile_stop_step",
+        type=int,
+        default=None,
+        help="force stop training at this global step after saving profiling artifacts / 指定したglobal stepで学習を停止し、プロファイル用成果物を保存する",
+    )
+    parser.add_argument(
+        "--profile_with_torch",
+        action="store_true",
+        help="enable torch.profiler capture for the capture step / capture stepでtorch.profilerを有効にする",
+    )
+    parser.add_argument(
+        "--profile_with_cuda_profiler_api",
+        action="store_true",
+        help="call cudaProfilerStart/Stop around capture step for nsys/ncu capture-range=cudaProfilerApi / capture stepの前後でcudaProfilerStart/Stopを呼ぶ",
+    )
+    parser.add_argument(
+        "--profile_artifacts_dir",
+        type=str,
+        default=None,
+        help="base directory for profiling artifacts (default: <output_dir>/profile_artifacts) / プロファイル成果物の保存先ディレクトリ",
+    )
+    parser.add_argument(
+        "--profile_disable_sampling",
+        action="store_true",
+        help="force-disable sample generation options (--sample_at_first, --sample_every_n_*) for profiling runs / プロファイル実行時にサンプル生成を強制的に無効化する",
+    )
+    parser.add_argument(
+        "--profile_save_model_on_stop",
+        action="store_true",
+        help="save LoRA checkpoint at profile_stop_step / profile_stop_stepでLoRAチェックポイントを保存する",
+    )
+    parser.add_argument(
+        "--profile_save_state_on_stop",
+        action="store_true",
+        help="save accelerate state at profile_stop_step / profile_stop_stepでaccelerate stateを保存する",
+    )
+    parser.add_argument(
+        "--profile_save_optimizer_summary_on_stop",
+        action="store_true",
+        help="save optimizer state summary JSON at profile_stop_step / profile_stop_stepでoptimizer state要約を保存する",
     )
 
     # optimizer and lr scheduler settings
