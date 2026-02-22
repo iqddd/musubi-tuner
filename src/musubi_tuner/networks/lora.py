@@ -4,6 +4,7 @@
 # https://github.com/cloneofsimo/lora/blob/master/lora_diffusion/lora.py
 
 import ast
+from contextlib import contextmanager, nullcontext
 import math
 import os
 import re
@@ -18,6 +19,37 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 HUNYUAN_TARGET_REPLACE_MODULES = ["MMDoubleStreamBlock", "MMSingleStreamBlock"]
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.lower() in ("1", "true", "yes", "on")
+
+
+_LORA_FORWARD_MARKERS = _env_flag("MUSUBI_LORA_FORWARD_MARKERS", default=False)
+_PROFILE_EMIT_NVTX = _env_flag("MUSUBI_PROFILE_EMIT_NVTX", default=False)
+
+
+@contextmanager
+def _nvtx_scope(name: str):
+    torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
+
+
+@contextmanager
+def _profile_scope(name: str):
+    if not _LORA_FORWARD_MARKERS:
+        with nullcontext():
+            yield
+        return
+    nvtx_ctx = _nvtx_scope(name) if _PROFILE_EMIT_NVTX and torch.cuda.is_available() and hasattr(torch.cuda, "nvtx") else nullcontext()
+    with torch.autograd.profiler.record_function(name), nvtx_ctx:
+        yield
 
 
 class LoRAModule(torch.nn.Module):
@@ -101,62 +133,77 @@ class LoRAModule(torch.nn.Module):
         del self.org_module
 
     def forward(self, x):
-        org_forwarded = self.org_forward(x)
+        with _profile_scope("lora/forward/org_forward"):
+            org_forwarded = self.org_forward(x)
 
         # module dropout
         if self.module_dropout is not None and self.training:
-            if torch.rand(1) < self.module_dropout:
-                return org_forwarded
+            with _profile_scope("lora/forward/module_dropout"):
+                if torch.rand(1) < self.module_dropout:
+                    return org_forwarded
 
         if self.split_dims is None:
-            lx = self.lora_down(x)
+            with _profile_scope("lora/forward/down"):
+                lx = self.lora_down(x)
 
             # normal dropout
             if self.dropout is not None and self.training:
-                lx = torch.nn.functional.dropout(lx, p=self.dropout)
+                with _profile_scope("lora/forward/dropout"):
+                    lx = torch.nn.functional.dropout(lx, p=self.dropout)
 
             # rank dropout
             if self.rank_dropout is not None and self.training:
-                mask = torch.rand((lx.size(0), self.lora_dim), device=lx.device) > self.rank_dropout
-                if len(lx.size()) == 3:
-                    mask = mask.unsqueeze(1)  # for Text Encoder
-                elif len(lx.size()) == 4:
-                    mask = mask.unsqueeze(-1).unsqueeze(-1)  # for Conv2d
-                lx = lx * mask
-
-                # scaling for rank dropout: treat as if the rank is changed
-                scale = self.scale * (1.0 / (1.0 - self.rank_dropout))  # redundant for readability
-            else:
-                scale = self.scale
-
-            lx = self.lora_up(lx)
-
-            return org_forwarded + lx * self.multiplier * scale
-        else:
-            lxs = [lora_down(x) for lora_down in self.lora_down]
-
-            # normal dropout
-            if self.dropout is not None and self.training:
-                lxs = [torch.nn.functional.dropout(lx, p=self.dropout) for lx in lxs]
-
-            # rank dropout
-            if self.rank_dropout is not None and self.training:
-                masks = [torch.rand((lx.size(0), self.lora_dim), device=lx.device) > self.rank_dropout for lx in lxs]
-                for i in range(len(lxs)):
+                with _profile_scope("lora/forward/rank_dropout"):
+                    mask = torch.rand((lx.size(0), self.lora_dim), device=lx.device) > self.rank_dropout
                     if len(lx.size()) == 3:
-                        masks[i] = masks[i].unsqueeze(1)
+                        mask = mask.unsqueeze(1)  # for Text Encoder
                     elif len(lx.size()) == 4:
-                        masks[i] = masks[i].unsqueeze(-1).unsqueeze(-1)
-                    lxs[i] = lxs[i] * masks[i]
+                        mask = mask.unsqueeze(-1).unsqueeze(-1)  # for Conv2d
+                    lx = lx * mask
 
-                # scaling for rank dropout: treat as if the rank is changed
-                scale = self.scale * (1.0 / (1.0 - self.rank_dropout))  # redundant for readability
+                    # scaling for rank dropout: treat as if the rank is changed
+                    scale = self.scale * (1.0 / (1.0 - self.rank_dropout))  # redundant for readability
             else:
                 scale = self.scale
 
-            lxs = [lora_up(lx) for lora_up, lx in zip(self.lora_up, lxs)]
+            with _profile_scope("lora/forward/up"):
+                lx = self.lora_up(lx)
 
-            return org_forwarded + torch.cat(lxs, dim=-1) * self.multiplier * scale
+            with _profile_scope("lora/forward/residual_add"):
+                return torch.add(org_forwarded, lx, alpha=self.multiplier * scale)
+        else:
+            with _profile_scope("lora/forward/down_split"):
+                lxs = [lora_down(x) for lora_down in self.lora_down]
+
+            # normal dropout
+            if self.dropout is not None and self.training:
+                with _profile_scope("lora/forward/dropout_split"):
+                    lxs = [torch.nn.functional.dropout(lx, p=self.dropout) for lx in lxs]
+
+            # rank dropout
+            if self.rank_dropout is not None and self.training:
+                with _profile_scope("lora/forward/rank_dropout_split"):
+                    masks = [torch.rand((lx.size(0), self.lora_dim), device=lx.device) > self.rank_dropout for lx in lxs]
+                    for i in range(len(lxs)):
+                        if len(lx.size()) == 3:
+                            masks[i] = masks[i].unsqueeze(1)
+                        elif len(lx.size()) == 4:
+                            masks[i] = masks[i].unsqueeze(-1).unsqueeze(-1)
+                        lxs[i] = lxs[i] * masks[i]
+
+                    # scaling for rank dropout: treat as if the rank is changed
+                    scale = self.scale * (1.0 / (1.0 - self.rank_dropout))  # redundant for readability
+            else:
+                scale = self.scale
+
+            with _profile_scope("lora/forward/up_split"):
+                lxs = [lora_up(lx) for lora_up, lx in zip(self.lora_up, lxs)]
+
+            with _profile_scope("lora/forward/cat_split"):
+                lx_cat = torch.cat(lxs, dim=-1)
+
+            with _profile_scope("lora/forward/residual_add_split"):
+                return torch.add(org_forwarded, lx_cat, alpha=self.multiplier * scale)
 
 
 class LoRAInfModule(LoRAModule):

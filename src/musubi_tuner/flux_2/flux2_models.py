@@ -1,6 +1,8 @@
 # # copy from FLUX repo: https://github.com/black-forest-labs/flux
 # # license: Apache-2.0 License
+from contextlib import contextmanager, nullcontext
 import math
+import os
 from dataclasses import dataclass, field
 
 import torch
@@ -22,6 +24,78 @@ from musubi_tuner.utils.model_utils import create_cpu_offloading_wrapper
 
 FP8_OPTIMIZATION_TARGET_KEYS = ["double_blocks", "single_blocks"]
 FP8_OPTIMIZATION_EXCLUDE_KEYS = ["norm", "pe_embedder", "time_in", "_modulation"]
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.lower() in ("1", "true", "yes", "on")
+
+
+H7_NARROW_COMPILE_ENABLED = _env_flag("MUSUBI_H7_NARROW_COMPILE", default=False)
+# Defaults are tuned for H7 narrow-compile stability on variable-seqlen FLUX.2 runs.
+H7_NARROW_COMPILE_MODE = os.getenv("MUSUBI_H7_NARROW_COMPILE_MODE", "default")
+H7_NARROW_COMPILE_DYNAMIC = _env_flag("MUSUBI_H7_NARROW_COMPILE_DYNAMIC", default=True)
+H7_NARROW_COMPILE_FULLGRAPH = _env_flag("MUSUBI_H7_NARROW_COMPILE_FULLGRAPH", default=False)
+H7_NARROW_COMPILE_BACKEND = os.getenv("MUSUBI_H7_NARROW_COMPILE_BACKEND", "inductor")
+H7_NARROW_COMPILE_RECOMPILE_LIMIT = os.getenv("MUSUBI_H7_NARROW_COMPILE_RECOMPILE_LIMIT", "64")
+H7_NARROW_COMPILE_ACCUM_RECOMPILE_LIMIT = os.getenv("MUSUBI_H7_NARROW_COMPILE_ACCUM_RECOMPILE_LIMIT", "2048")
+H7_NARROW_COMPILE_FORCE_CONTIGUOUS = _env_flag("MUSUBI_H7_NARROW_COMPILE_FORCE_CONTIGUOUS", default=True)
+PROFILE_EMIT_NVTX = _env_flag("MUSUBI_PROFILE_EMIT_NVTX", default=False)
+
+
+@contextmanager
+def _nvtx_scope(name: str):
+    torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
+
+
+@contextmanager
+def _profile_scope(name: str):
+    nvtx_ctx = (
+        _nvtx_scope(name) if PROFILE_EMIT_NVTX and torch.cuda.is_available() and hasattr(torch.cuda, "nvtx") else nullcontext()
+    )
+    with torch.autograd.profiler.record_function(name), nvtx_ctx:
+        yield
+
+
+def _compile_hotpath(fn):
+    if not H7_NARROW_COMPILE_ENABLED:
+        return fn
+    try:
+        return torch.compile(
+            fn,
+            backend=H7_NARROW_COMPILE_BACKEND,
+            mode=H7_NARROW_COMPILE_MODE,
+            dynamic=H7_NARROW_COMPILE_DYNAMIC,
+            fullgraph=H7_NARROW_COMPILE_FULLGRAPH,
+        )
+    except Exception:
+        return fn
+
+
+def _maybe_apply_h7_dynamo_limits() -> None:
+    if not H7_NARROW_COMPILE_ENABLED:
+        return
+    try:
+        import torch._dynamo.config as dynamo_config
+    except Exception:
+        return
+
+    if H7_NARROW_COMPILE_RECOMPILE_LIMIT:
+        try:
+            dynamo_config.recompile_limit = int(H7_NARROW_COMPILE_RECOMPILE_LIMIT)
+        except ValueError:
+            pass
+    if H7_NARROW_COMPILE_ACCUM_RECOMPILE_LIMIT:
+        try:
+            dynamo_config.accumulated_recompile_limit = int(H7_NARROW_COMPILE_ACCUM_RECOMPILE_LIMIT)
+        except ValueError:
+            pass
 
 
 @dataclass
@@ -608,14 +682,15 @@ class Flux2(nn.Module):
         double_block_mod_txt = self.double_stream_modulation_txt(vec)
         single_block_mod, _ = self.single_stream_modulation(vec)
 
-        img = self.img_in(x)
-        del x
-        txt = self.txt_in(ctx)
-        del ctx
-        pe_x = self.pe_embedder(x_ids)
-        del x_ids
-        pe_ctx = self.pe_embedder(ctx_ids)
-        del ctx_ids
+        with _profile_scope("flux/input_embed"):
+            img = self.img_in(x)
+            del x
+            txt = self.txt_in(ctx)
+            del ctx
+            pe_x = self.pe_embedder(x_ids)
+            del x_ids
+            pe_ctx = self.pe_embedder(ctx_ids)
+            del ctx_ids
 
         attn_params = AttentionParams.create_attention_params(self.attn_mode, self.split_attn)  # No attention mask
 
@@ -623,23 +698,26 @@ class Flux2(nn.Module):
             if self.blocks_to_swap:
                 self.offloader_double.wait_for_block(block_idx)
 
-            img, txt = block(img, txt, pe_x, pe_ctx, double_block_mod_img, double_block_mod_txt, attn_params)
+            with _profile_scope(f"flux/double_block/{block_idx:02d}"):
+                img, txt = block(img, txt, pe_x, pe_ctx, double_block_mod_img, double_block_mod_txt, attn_params)
 
             if self.blocks_to_swap:
                 self.offloader_double.submit_move_blocks_forward(self.double_blocks, block_idx)
 
         del double_block_mod_img, double_block_mod_txt
 
-        img = torch.cat((txt, img), dim=1)
-        del txt
-        pe = torch.cat((pe_ctx, pe_x), dim=2)
-        del pe_ctx, pe_x
+        with _profile_scope("flux/concat_streams"):
+            img = torch.cat((txt, img), dim=1)
+            del txt
+            pe = torch.cat((pe_ctx, pe_x), dim=2)
+            del pe_ctx, pe_x
 
         for block_idx, block in enumerate(self.single_blocks):
             if self.blocks_to_swap:
                 self.offloader_single.wait_for_block(block_idx)
 
-            img = block(img, pe, single_block_mod, attn_params)
+            with _profile_scope(f"flux/single_block/{block_idx:02d}"):
+                img = block(img, pe, single_block_mod, attn_params)
 
             if self.blocks_to_swap:
                 self.offloader_single.submit_move_blocks_forward(self.single_blocks, block_idx)
@@ -650,7 +728,8 @@ class Flux2(nn.Module):
 
         img = img[:, num_txt_tokens:, ...]
 
-        img = self.final_layer(img, vec)
+        with _profile_scope("flux/final_layer"):
+            img = self.final_layer(img, vec)
         return img
 
 
@@ -961,16 +1040,35 @@ def timestep_embedding(t: Tensor, dim, max_period=10000, time_factor: float = 10
     return embedding
 
 
+def _rmsnorm_hotpath(x: Tensor, scale: Tensor):
+    x_dtype = x.dtype
+    x = x.float()
+    rrms = torch.rsqrt(torch.mean(x**2, dim=-1, keepdim=True) + 1e-6)
+    return (x * rrms).to(dtype=x_dtype) * scale
+
+
+_maybe_apply_h7_dynamo_limits()
+_RMSNORM_HOTPATH = _compile_hotpath(_rmsnorm_hotpath)
+
+
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int):
         super().__init__()
         self.scale = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: Tensor):
+        if H7_NARROW_COMPILE_ENABLED:
+            with _profile_scope("h7/rmsnorm/compiled"):
+                return _RMSNORM_HOTPATH(x, self.scale)
+
         x_dtype = x.dtype
-        x = x.float()
-        rrms = torch.rsqrt(torch.mean(x**2, dim=-1, keepdim=True) + 1e-6)
-        return (x * rrms).to(dtype=x_dtype) * self.scale
+        with _profile_scope("h7/rmsnorm/cast_in"):
+            x = x.float()
+        with _profile_scope("h7/rmsnorm/core"):
+            rrms = torch.rsqrt(torch.mean(x**2, dim=-1, keepdim=True) + 1e-6)
+            y = x * rrms
+        with _profile_scope("h7/rmsnorm/cast_out_scale"):
+            return y.to(dtype=x_dtype) * self.scale
 
 
 class QKNorm(torch.nn.Module):
@@ -1009,12 +1107,34 @@ def rope(pos: Tensor, dim: int, theta: int) -> Tensor:
     return out.float()
 
 
-def apply_rope(xq: Tensor, xk: Tensor, freqs_cis: Tensor) -> tuple[Tensor, Tensor]:
+def _apply_rope_hotpath(xq: Tensor, xk: Tensor, freqs_cis: Tensor) -> tuple[Tensor, Tensor]:
     xq_ = xq.float().reshape(*xq.shape[:-1], -1, 1, 2)
     xk_ = xk.float().reshape(*xk.shape[:-1], -1, 1, 2)
     xq_out = freqs_cis[..., 0] * xq_[..., 0] + freqs_cis[..., 1] * xq_[..., 1]
     xk_out = freqs_cis[..., 0] * xk_[..., 0] + freqs_cis[..., 1] * xk_[..., 1]
     return xq_out.reshape(*xq.shape).type_as(xq), xk_out.reshape(*xk.shape).type_as(xk)
+
+
+_APPLY_ROPE_HOTPATH = _compile_hotpath(_apply_rope_hotpath)
+
+
+def apply_rope(xq: Tensor, xk: Tensor, freqs_cis: Tensor) -> tuple[Tensor, Tensor]:
+    if H7_NARROW_COMPILE_ENABLED:
+        if H7_NARROW_COMPILE_FORCE_CONTIGUOUS:
+            xq = xq.contiguous()
+            xk = xk.contiguous()
+            freqs_cis = freqs_cis.contiguous()
+        with _profile_scope("h7/apply_rope/compiled"):
+            return _APPLY_ROPE_HOTPATH(xq, xk, freqs_cis)
+
+    with _profile_scope("h7/apply_rope/cast_in"):
+        xq_ = xq.float().reshape(*xq.shape[:-1], -1, 1, 2)
+        xk_ = xk.float().reshape(*xk.shape[:-1], -1, 1, 2)
+    with _profile_scope("h7/apply_rope/core"):
+        xq_out = freqs_cis[..., 0] * xq_[..., 0] + freqs_cis[..., 1] * xq_[..., 1]
+        xk_out = freqs_cis[..., 0] * xk_[..., 0] + freqs_cis[..., 1] * xk_[..., 1]
+    with _profile_scope("h7/apply_rope/cast_out"):
+        return xq_out.reshape(*xq.shape).type_as(xq), xk_out.reshape(*xk.shape).type_as(xk)
 
 
 # endregion

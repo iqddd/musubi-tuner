@@ -14,3 +14,13 @@ AGENTS.md
 .vscode/settings.json
 .mcp.json
 references/
+
+# speedup_task generated artifacts
+speedup_task/__pycache__/
+speedup_task/h1_check/
+speedup_task/h2_cast_check/
+speedup_task/h5_check/
+speedup_task/h7_phase0_check/
+speedup_task/nondet_n5_m12_adamw/
+speedup_task/record_function_check/
+speedup_task/h7_phase1_analysis/*.csv

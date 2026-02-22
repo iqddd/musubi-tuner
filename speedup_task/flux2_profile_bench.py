@@ -36,6 +36,7 @@ def build_base_train_cmd(args: argparse.Namespace, run_dir: Path) -> list[str]:
         cmd.append("--profile_with_torch")
     else:
         cmd.append("--profile_with_cuda_profiler_api")
+        cmd.append("--profile_emit_nvtx")
 
     if args.extra_train_args:
         cmd.extend(args.extra_train_args)
@@ -115,6 +116,8 @@ def main():
 
     train_cmd = build_base_train_cmd(args, run_dir)
     full_cmd = wrap_with_gpu_profiler(args, train_cmd, run_dir)
+    if args.profiler in ("nsys", "ncu"):
+        full_cmd = ["env", "MUSUBI_PROFILE_EMIT_NVTX=1", *full_cmd]
 
     command_text = shlex.join(full_cmd)
     (run_dir / "run_command.sh").write_text(command_text + "\n", encoding="utf-8")

@@ -1,5 +1,6 @@
 import ast
 import asyncio
+from contextlib import contextmanager, nullcontext
 from datetime import timedelta
 import gc
 import importlib
@@ -156,6 +157,26 @@ def clean_memory_on_device(device: torch.device):
         torch.xpu.empty_cache()
     if device.type == "mps":
         torch.mps.empty_cache()
+
+
+@contextmanager
+def _nvtx_range(name: str):
+    torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
+
+
+@contextmanager
+def _profile_scope(name: str, emit_nvtx: bool = False):
+    nvtx_ctx = (
+        _nvtx_range(name)
+        if emit_nvtx and torch.cuda.is_available() and hasattr(torch.cuda, "nvtx")
+        else nullcontext()
+    )
+    with torch.autograd.profiler.record_function(name), nvtx_ctx:
+        yield
 
 
 # for collate_fn: epoch and step is multiprocessing.Value
@@ -1751,6 +1772,7 @@ class NetworkTrainer:
             return
 
         profiling_run_enabled = args.profile_capture_step is not None or args.profile_stop_step is not None
+        profile_emit_nvtx = bool(args.profile_emit_nvtx)
         if profiling_run_enabled:
             if args.profile_capture_step is None or args.profile_stop_step is None:
                 raise ValueError(
@@ -1773,6 +1795,10 @@ class NetworkTrainer:
                 args.sample_every_n_epochs = None
                 args.sample_prompts = None
                 logger.info("Profiling mode: sample generation is forcibly disabled / プロファイル実行のためサンプル生成を無効化しました")
+        elif profile_emit_nvtx:
+            logger.warning(
+                "--profile_emit_nvtx is enabled but profiling capture/stop steps are not set; NVTX markers will still be emitted."
+            )
 
         session_id = random.randint(0, 2**32)
         training_started_at = time.time()
@@ -2456,28 +2482,28 @@ class NetworkTrainer:
 
                     accelerator.unwrap_model(network).on_step_start()
 
-                    with torch.autograd.profiler.record_function("train/batch_prep"):
+                    with _profile_scope("train/batch_prep", emit_nvtx=profile_emit_nvtx):
                         latents = self.scale_shift_latents(latents)
                         # Sample noise that we'll add to the latents
                         noise = torch.randn_like(latents)
 
-                    with torch.autograd.profiler.record_function("train/timestep_sampling_and_noisy_input"):
+                    with _profile_scope("train/timestep_sampling_and_noisy_input", emit_nvtx=profile_emit_nvtx):
                         # calculate model input and timesteps
                         noisy_model_input, timesteps = self.get_noisy_model_input_and_timesteps(
                             args, noise, latents, batch["timesteps"], noise_scheduler, accelerator.device, dit_dtype
                         )
 
-                    with torch.autograd.profiler.record_function("train/loss_weighting"):
+                    with _profile_scope("train/loss_weighting", emit_nvtx=profile_emit_nvtx):
                         weighting = compute_loss_weighting_for_sd3(
                             args.weighting_scheme, noise_scheduler, timesteps, accelerator.device, dit_dtype
                         )
 
-                    with torch.autograd.profiler.record_function("train/dit_forward"):
+                    with _profile_scope("train/dit_forward", emit_nvtx=profile_emit_nvtx):
                         model_pred, target = self.call_dit(
                             args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype
                         )
 
-                    with torch.autograd.profiler.record_function("train/loss_compute"):
+                    with _profile_scope("train/loss_compute", emit_nvtx=profile_emit_nvtx):
                         loss = torch.nn.functional.mse_loss(model_pred.to(network_dtype), target, reduction="none")
 
                         if weighting is not None:
@@ -2488,11 +2514,11 @@ class NetworkTrainer:
 
                         loss = loss.mean()  # mean loss over all elements in batch
 
-                    with torch.autograd.profiler.record_function("train/backward"):
+                    with _profile_scope("train/backward", emit_nvtx=profile_emit_nvtx):
                         accelerator.backward(loss)
 
                     if accelerator.sync_gradients:
-                        with torch.autograd.profiler.record_function("train/grad_sync_and_clip"):
+                        with _profile_scope("train/grad_sync_and_clip", emit_nvtx=profile_emit_nvtx):
                             # self.all_reduce_network(accelerator, network)  # sync DDP grad manually
                             state = accelerate.PartialState()
                             if state.distributed_type != accelerate.DistributedType.NO:
@@ -2504,11 +2530,11 @@ class NetworkTrainer:
                                 params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
                                 accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
-                    with torch.autograd.profiler.record_function("train/optimizer_step"):
+                    with _profile_scope("train/optimizer_step", emit_nvtx=profile_emit_nvtx):
                         optimizer.step()
-                    with torch.autograd.profiler.record_function("train/lr_scheduler_step"):
+                    with _profile_scope("train/lr_scheduler_step", emit_nvtx=profile_emit_nvtx):
                         lr_scheduler.step()
-                    with torch.autograd.profiler.record_function("train/optimizer_zero_grad"):
+                    with _profile_scope("train/optimizer_zero_grad", emit_nvtx=profile_emit_nvtx):
                         optimizer.zero_grad(set_to_none=True)
 
                 if args.scale_weight_norms:
@@ -2534,7 +2560,7 @@ class NetworkTrainer:
                     ):
                         stop_single_step_profiling(global_step)
 
-                    with torch.autograd.profiler.record_function("train/sampling_and_checkpoint_hooks"):
+                    with _profile_scope("train/sampling_and_checkpoint_hooks", emit_nvtx=profile_emit_nvtx):
                         # to avoid calling optimizer_eval_fn() too frequently, we call it only when we need to sample images or save the model
                         should_sampling = should_sample_images(args, global_step, epoch=None)
                         should_saving = args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0
@@ -2559,7 +2585,7 @@ class NetworkTrainer:
                                         remove_model(remove_ckpt_name)
                             optimizer_train_fn()
 
-                with torch.autograd.profiler.record_function("train/step_logging"):
+                with _profile_scope("train/step_logging", emit_nvtx=profile_emit_nvtx):
                     current_loss = loss.detach().item()
                     loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
                     avr_loss: float = loss_recorder.moving_average
@@ -2895,6 +2921,11 @@ def setup_parser_common() -> argparse.ArgumentParser:
         "--profile_with_cuda_profiler_api",
         action="store_true",
         help="call cudaProfilerStart/Stop around capture step for nsys/ncu capture-range=cudaProfilerApi / capture stepの前後でcudaProfilerStart/Stopを呼ぶ",
+    )
+    parser.add_argument(
+        "--profile_emit_nvtx",
+        action="store_true",
+        help="emit explicit NVTX ranges for train/* scopes (useful for nsys critical-path attribution) / train/*スコープの明示的なNVTXレンジを出力する",
     )
     parser.add_argument(
         "--profile_artifacts_dir",
