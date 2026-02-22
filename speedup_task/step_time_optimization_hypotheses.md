@@ -12,16 +12,14 @@ Date recorded: 2026-02-22
 | H4 | Disable `gradient_checkpointing` (or find a compromise) | Compare step time with `gradient_checkpointing=true/false` while tracking VRAM | High | discarded (not feasible on 32 GB VRAM setup) |
 | H5 | Vectorize timestep sampling with `preserve_distribution_shape=true` | Remove Python loops/per-element filtering while preserving current sampling math | Low/Medium | discarded (tested, no speedup) |
 | H6 | Improve DataLoader/CPU->GPU pipeline | Test `num_workers`, `pin_memory`, batch transfer path, and cache-read contribution | Low/Medium (may grow after compute-side speedups) | not tested |
-| H7 | Reduce per-step launch overhead | Reduce number of small kernel launches and host overhead (per profiler: `cudaLaunchKernel`, `Command Buffer Full`) | Medium | in progress (phase-0 instrumentation done) |
+| H7 | Reduce per-step launch overhead | Reduce number of small kernel launches and host overhead (per profiler: `cudaLaunchKernel`, `Command Buffer Full`) | Medium | in progress (phase-1 attribution done) |
 | H8 | Add step-time metrics to profiling artifacts | Write `step_wall_ms/fwd_bwd_ms/data_wait_ms` to `run_result.json` and compare automatically | Infrastructure impact (faster optimization loop) | not tested |
 
 ## TODO
 
-- Add profiler attribution instrumentation for precise mapping from hotspots to Python code blocks:
-- Use `with_stack=True` capture to map top `aten::to/_to_copy/copy_` and element-wise hotspots to exact Python callsites.
-- Use new `record_function` sections to split launch overhead by train-step stage and identify first actionable target.
-- Partial progress already done: `train/optimizer_step`, `train/lr_scheduler_step`, `train/optimizer_zero_grad`.
-- Re-run single-step capture and use this for final source-level attribution of `aten::to/_to_copy/copy_` and element-wise kernels.
+- H7 phase-2: add narrow `record_function`/NVTX around top phase-1 callsites (`flux2_models.RMSNorm.forward`, `flux2_models.apply_rope`) to split cast vs element-wise contribution more precisely.
+- H7 phase-3: implement one minimal code change in top hotspot, run A/B on the same capture settings, and validate against nondeterminism envelope.
+- H3 smoke-test: run conservative `--compile` A/B (`compile_mode=default`, then `reduce-overhead`) with OOM guardrails and compare step wall + launch metrics.
 
 ## Verification Log
 
@@ -188,6 +186,37 @@ Observed:
 Conclusion:
 - H7 phase-0 instrumentation is complete and usable for source-level hotspot attribution.
 - Next H7 step is to extract top `aten::to/_to_copy/copy_` and element-wise callsites from this capture and rank by impact.
+
+### H7 phase-1 (2026-02-22)
+
+Goal: map cast/element-wise hotspots to concrete Python callsites and train-step stages.
+
+Method:
+- Reused phase-0 trace with stacks:
+- `speedup_task/h7_phase0_check/20260222204605_torch_capture0005_stop0012/artifacts/20260222204612_capture00000005_stop00000012/torch_profiler/rank00/step00000005.json`
+- Added analysis script:
+- `speedup_task/h7_phase1_trace_attribution.py`
+- Output artifacts:
+- `speedup_task/h7_phase1_analysis/h7_phase1_group_summary.csv`
+- `speedup_task/h7_phase1_analysis/h7_phase1_op_stage_callsite.csv`
+- `speedup_task/h7_phase1_analysis/h7_phase1_stage_callsite.csv`
+- `speedup_task/h7_phase1_analysis/h7_phase1_attribution_report.md`
+
+Measured (single captured step):
+- Cast ops (`aten::to/_to_copy/copy_`): `7038` calls, `2168.920 ms` summed CPU duration.
+- Element-wise ops: `5495` calls, `2084.233 ms` summed CPU duration.
+- Stage split:
+- Cast in `train/backward`: `4709` calls, `1738.350 ms`; in `train/dit_forward`: `2318` calls, `430.452 ms`.
+- Element-wise in `train/backward`: `3658` calls, `1838.633 ms`; in `train/dit_forward`: `1579` calls, `245.192 ms`.
+- Top project callsites (cast + element-wise, aggregated):
+- `train/backward`: `flux_2/flux2_models.py(969): forward` -> `374.575 ms`
+- `train/backward`: `flux_2/flux2_models.py(1012): apply_rope` -> `236.125 ms`
+- `train/dit_forward`: `flux_2/flux2_models.py(1012): apply_rope` -> `153.192 ms`
+- `train/dit_forward`: `flux_2/flux2_models.py(969): forward` -> `145.260 ms`
+
+Conclusion:
+- H7 phase-1 confirms the main cast/element-wise pressure is concentrated in backward, with strongest project-local hotspots around `RMSNorm.forward` and `apply_rope`.
+- Best next step is phase-2 targeted instrumentation in these two locations before applying a minimal optimization patch.
 
 ## Why These Hypotheses Exist (Brief)
 
