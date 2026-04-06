@@ -12,7 +12,6 @@ from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from . import lora as lora_module
 from .network_arch import detect_arch_config
@@ -99,6 +98,10 @@ class LoKrModule(torch.nn.Module):
         # Factorize dimensions
         in_m, in_n = factorization(in_dim, factor)
         out_l, out_k = factorization(out_dim, factor)
+        self.in_m = in_m
+        self.in_n = in_n
+        self.out_l = out_l
+        self.out_k = out_k
 
         # w1 is always a full matrix (the "scale" factor, small)
         self.lokr_w1 = nn.Parameter(torch.empty(out_l, in_m))
@@ -154,6 +157,20 @@ class LoKrModule(torch.nn.Module):
             w2 = self.lokr_w2_a @ self.lokr_w2_b
         return make_kron(w1, w2, self.scale)
 
+    def _apply_lokr_linear(self, x):
+        """Compute F.linear(x, kron(w1, w2)) without materializing the full Kronecker product."""
+        x_reshaped = x.reshape(*x.shape[:-1], self.in_m, self.in_n)
+
+        if self.use_w2:
+            tmp = torch.matmul(x_reshaped, self.lokr_w2.transpose(-1, -2))
+        else:
+            tmp = torch.matmul(x_reshaped, self.lokr_w2_b.transpose(-1, -2))
+            tmp = torch.matmul(tmp, self.lokr_w2_a.transpose(-1, -2))
+
+        # Broadcast matmul over the batch/sequence dimensions.
+        out = torch.matmul(self.lokr_w1, tmp)
+        return out.reshape(*x.shape[:-1], self.out_l * self.out_k) * self.scale
+
     def forward(self, x):
         org_forwarded = self.org_forward(x)
 
@@ -162,18 +179,17 @@ class LoKrModule(torch.nn.Module):
             if torch.rand(1) < self.module_dropout:
                 return org_forwarded
 
-        diff_weight = self.get_diff_weight()
-
         # rank dropout
         if self.rank_dropout is not None and self.training:
-            drop = (torch.rand(diff_weight.size(0), device=diff_weight.device) > self.rank_dropout).to(diff_weight.dtype)
-            drop = drop.view(-1, 1)
-            diff_weight = diff_weight * drop
-            scale = 1.0 / (1.0 - self.rank_dropout)
+            out = self._apply_lokr_linear(x)
+            drop = (torch.rand(out.size(-1), device=out.device) > self.rank_dropout).to(out.dtype)
+            out = out * drop.view(*([1] * (out.ndim - 1)), -1)
+            dropout_scale = 1.0 / (1.0 - self.rank_dropout)
         else:
-            scale = 1.0
+            out = self._apply_lokr_linear(x)
+            dropout_scale = 1.0
 
-        return org_forwarded + F.linear(x, diff_weight) * self.multiplier * scale
+        return org_forwarded + out * self.multiplier * dropout_scale
 
 
 class LoKrInfModule(LoKrModule):
@@ -245,8 +261,7 @@ class LoKrInfModule(LoKrModule):
         return weight
 
     def default_forward(self, x):
-        diff_weight = self.get_diff_weight()
-        return self.org_forward(x) + F.linear(x, diff_weight) * self.multiplier
+        return self.org_forward(x) + self._apply_lokr_linear(x) * self.multiplier
 
     def forward(self, x):
         if not self.enabled:
