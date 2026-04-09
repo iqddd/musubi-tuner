@@ -13,6 +13,7 @@ from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from musubi_tuner.networks import lora as lora_module
 
 logger = logging.getLogger(__name__)
@@ -82,6 +83,23 @@ def packed_oft_blocks_to_export(packed_oft_blocks: torch.Tensor, block_size: int
 
 def export_oft_blocks_to_skew(oft_blocks: torch.Tensor) -> torch.Tensor:
     return oft_blocks - oft_blocks.transpose(-1, -2)
+
+
+def get_linear_weight(linear: nn.Linear) -> torch.Tensor:
+    """Return the dequantized effective weight for Linear modules, including FP8-patched ones."""
+    weight = linear.weight
+    scale_weight = getattr(linear, "scale_weight", None)
+    if scale_weight is None:
+        return weight
+
+    original_dtype = scale_weight.dtype
+    if scale_weight.ndim < 3:
+        return weight.to(original_dtype) * scale_weight
+
+    out_features, num_blocks, _ = scale_weight.shape
+    dequantized_weight = weight.to(original_dtype).contiguous().view(out_features, num_blocks, -1)
+    dequantized_weight = dequantized_weight * scale_weight
+    return dequantized_weight.view(weight.shape)
 
 
 def build_rotation(skew_blocks: torch.Tensor, alpha: float | torch.Tensor) -> torch.Tensor:
@@ -166,6 +184,7 @@ class BOFTModule(torch.nn.Module):
         module_dropout=None,
         rescaled=False,
         train_representation="full",
+        forward_path="weight",
         module_layouts: Optional[Dict[str, Dict[str, int]]] = None,
         **kwargs,
     ):
@@ -193,6 +212,9 @@ class BOFTModule(torch.nn.Module):
 
         if train_representation not in {"full", "packed"}:
             raise ValueError(f"Unsupported BOFT train_representation={train_representation!r}, expected 'full' or 'packed'")
+        forward_path = str(forward_path).lower()
+        if forward_path not in {"activation", "weight"}:
+            raise ValueError(f"Unsupported BOFT forward_path={forward_path!r}, expected 'activation' or 'weight'")
 
         if block_size * block_num != org_module.out_features:
             raise ValueError(
@@ -205,6 +227,7 @@ class BOFTModule(torch.nn.Module):
         self.boft_m = _stage_count(block_num)
         self.rescaled = rescaled
         self.train_representation = train_representation
+        self.use_weight_forward = forward_path == "weight"
 
         if self.train_representation == "packed":
             self.packed_block_size = _packed_block_size(self.block_size)
@@ -257,7 +280,7 @@ class BOFTModule(torch.nn.Module):
     def get_diff_weight(self, multiplier=None):
         if multiplier is None:
             multiplier = self.multiplier
-        org_weight = self.org_module_ref[0].weight.to(torch.float)
+        org_weight = get_linear_weight(self.org_module_ref[0]).to(torch.float)
         return (
             apply_boft_to_weight(
             org_weight,
@@ -269,7 +292,7 @@ class BOFTModule(torch.nn.Module):
             - org_weight
         ) * multiplier
 
-    def forward(self, x):
+    def _forward_activation_path(self, x):
         org_forwarded = self.org_forward(x)
 
         if self.module_dropout is not None and self.training:
@@ -286,6 +309,41 @@ class BOFTModule(torch.nn.Module):
             rescale=self._rescale_param(),
         )
         return org_forwarded + (transformed - projected) * self.multiplier
+
+    def _forward_weight_path(self, x):
+        if self.module_dropout is not None and self.training:
+            if torch.rand(1, device=x.device) < self.module_dropout:
+                return self.org_forward(x)
+
+        org_module = self.org_module_ref[0]
+        base_weight = get_linear_weight(org_module)
+        base_weight = base_weight.to(device=x.device)
+        skew_blocks = self.skew_oft_blocks()
+        transformed_weight = apply_boft_to_weight(
+            base_weight,
+            skew_blocks,
+            self.alpha,
+            scale=self.multiplier,
+            rescale=self._rescale_param(),
+        )
+        if self.multiplier == 1.0:
+            effective_weight = transformed_weight
+        else:
+            effective_weight = base_weight + (transformed_weight - base_weight) * self.multiplier
+
+        if effective_weight.dtype != x.dtype:
+            effective_weight = effective_weight.to(dtype=x.dtype)
+
+        bias = org_module.bias
+        if bias is not None:
+            bias = bias.to(device=x.device, dtype=effective_weight.dtype)
+
+        return F.linear(x, effective_weight, bias)
+
+    def forward(self, x):
+        if self.use_weight_forward:
+            return self._forward_weight_path(x)
+        return self._forward_activation_path(x)
 
 
 class BOFTInfModule(BOFTModule):
@@ -455,8 +513,10 @@ def create_network_from_weights(
     modules_alpha = {}
     module_layouts: Dict[str, Dict[str, int]] = {}
     train_representation = str(kwargs.get("train_representation", "full")).lower()
+    forward_path = str(kwargs.get("forward_path", "weight")).lower()
     if for_inference:
         train_representation = "full"
+        forward_path = "activation"
 
     for key, value in weights_sd.items():
         if "." not in key:
@@ -493,7 +553,7 @@ def create_network_from_weights(
         modules_dim=modules_dim,
         modules_alpha=modules_alpha,
         module_class=module_class,
-        module_kwargs={"module_layouts": module_layouts, "train_representation": train_representation},
+        module_kwargs={"module_layouts": module_layouts, "train_representation": train_representation, "forward_path": forward_path},
     )
     return network
 
@@ -517,7 +577,8 @@ def create_arch_network(
 
     rescaled = _bool_arg(kwargs.pop("rescaled", False))
     train_representation = str(kwargs.pop("train_representation", "full")).lower()
-    module_kwargs = {"rescaled": rescaled, "train_representation": train_representation}
+    forward_path = str(kwargs.pop("forward_path", "weight")).lower()
+    module_kwargs = {"rescaled": rescaled, "train_representation": train_representation, "forward_path": forward_path}
 
     return create_network(
         target_replace_modules,
