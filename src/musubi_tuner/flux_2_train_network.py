@@ -41,6 +41,8 @@ class Flux2NetworkTrainer(NetworkTrainer):
 
     def handle_model_specific_args(self, args):
         self.model_version_info = flux2_utils.FLUX2_MODEL_INFO[args.model_version]
+        if args.network_module == "networks.boft_flux_2" and not args.model_version.startswith("klein"):
+            raise ValueError("BOFT v1 is supported only for FLUX.2 Klein model versions in this implementation")
         self.dit_dtype = torch.float16 if args.mixed_precision == "fp16" else torch.bfloat16
         self._i2v_training = False
         self._control_training = False  # this means video training, not control image training

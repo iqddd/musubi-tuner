@@ -15,7 +15,7 @@ from musubi_tuner.flux_2 import flux2_utils
 from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
 from musubi_tuner.flux_2 import flux2_models
 from musubi_tuner.utils import model_utils
-from musubi_tuner.utils.lora_utils import filter_lora_state_dict
+from musubi_tuner.utils.lora_utils import detect_network_type, filter_lora_state_dict
 
 lycoris_available = find_spec("lycoris") is not None
 
@@ -34,6 +34,11 @@ class GenerationSettings:
     def __init__(self, device: torch.device, dit_weight_dtype: Optional[torch.dtype] = None):
         self.device = device
         self.dit_weight_dtype = dit_weight_dtype  # not used currently because model may be optimized
+
+
+def ensure_boft_supported_for_flux2(model_version: str, lora_sd: Dict[str, torch.Tensor]) -> None:
+    if detect_network_type(lora_sd) == "boft" and not model_version.startswith("klein"):
+        raise ValueError("BOFT v1 is supported only for FLUX.2 Klein model versions in this implementation")
 
 
 def parse_args() -> argparse.Namespace:
@@ -299,10 +304,13 @@ def load_dit_model(
     # load LoRA weights
     if not args.lycoris and args.lora_weight is not None and len(args.lora_weight) > 0:
         lora_weights_list = []
-        for lora_weight in args.lora_weight:
+        for i, lora_weight in enumerate(args.lora_weight):
             logger.info(f"Loading LoRA weight from: {lora_weight}")
             lora_sd = load_file(lora_weight)  # load on CPU, dtype is as is
-            lora_sd = filter_lora_state_dict(lora_sd, args.include_patterns, args.exclude_patterns)
+            include_pattern = args.include_patterns[i] if args.include_patterns is not None and len(args.include_patterns) > i else None
+            exclude_pattern = args.exclude_patterns[i] if args.exclude_patterns is not None and len(args.exclude_patterns) > i else None
+            lora_sd = filter_lora_state_dict(lora_sd, include_pattern, exclude_pattern)
+            ensure_boft_supported_for_flux2(args.model_version, lora_sd)
             lora_weights_list.append(lora_sd)
     else:
         lora_weights_list = None

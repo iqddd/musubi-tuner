@@ -23,7 +23,7 @@ from musubi_tuner.utils.safetensors_utils import (
 
 
 def detect_network_type(lora_sd: Dict[str, torch.Tensor]) -> str:
-    """Detect network type (lora, loha, lokr) from state dict keys."""
+    """Detect network type (lora, loha, lokr, boft) from state dict keys."""
     for key in lora_sd:
         if "lora_down" in key:
             return "lora"
@@ -31,6 +31,8 @@ def detect_network_type(lora_sd: Dict[str, torch.Tensor]) -> str:
             return "loha"
         if "lokr_w1" in key:
             return "lokr"
+        if key.endswith("oft_blocks") and lora_sd[key].ndim == 4:
+            return "boft"
     return "lora"  # default
 
 
@@ -156,6 +158,10 @@ def load_safetensors_with_lora_and_fp8(
                     from musubi_tuner.networks.lokr import merge_weights_to_tensor as lokr_merge
 
                     model_weight = lokr_merge(model_weight, lora_name, lora_sd, lora_weight_keys, multiplier, calc_device)
+                elif net_type == "boft":
+                    from musubi_tuner.networks.boft import merge_weights_to_tensor as boft_merge
+
+                    model_weight = boft_merge(model_weight, lora_name, lora_sd, lora_weight_keys, multiplier, calc_device)
                 else:
                     # standard LoRA (lora_down/lora_up)
                     down_key = lora_name + ".lora_down.weight"
