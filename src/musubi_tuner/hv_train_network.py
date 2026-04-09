@@ -1810,7 +1810,11 @@ class NetworkTrainer:
         if args.dim_from_weights:
             logger.info(f"Loading network from weights: {args.dim_from_weights}")
             weights_sd = load_file(args.dim_from_weights)
-            network, _ = network_module.create_arch_network_from_weights(1, weights_sd, unet=transformer)
+            network_from_weights = network_module.create_arch_network_from_weights(1, weights_sd, unet=transformer)
+            if isinstance(network_from_weights, tuple):
+                network = network_from_weights[0]
+            else:
+                network = network_from_weights
         else:
             # We use the name create_arch_network for compatibility with LyCORIS
             if hasattr(network_module, "create_arch_network"):

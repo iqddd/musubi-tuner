@@ -24,7 +24,7 @@ from tqdm import tqdm
 from musubi_tuner.dataset import image_video_dataset
 from musubi_tuner.networks import lora_wan
 from musubi_tuner.utils import model_utils
-from musubi_tuner.utils.lora_utils import filter_lora_state_dict
+from musubi_tuner.utils.lora_utils import detect_network_type, filter_lora_state_dict
 from musubi_tuner.utils.safetensors_utils import mem_eff_save_file
 from musubi_tuner.wan.configs import WAN_CONFIGS, SUPPORTED_SIZES
 from musubi_tuner.wan.modules.model import WanModel, load_wan_model, detect_wan_sd_dtype
@@ -794,6 +794,8 @@ def merge_lora_weights(
             if len(weights_sd) == 0:
                 logger.warning("No keys left after filtering.")
 
+        net_type = detect_network_type(weights_sd)
+
         if lycoris:
             lycoris_net, _ = create_network_from_weights(
                 multiplier=lora_multiplier,
@@ -806,7 +808,14 @@ def merge_lora_weights(
             )
             lycoris_net.merge_to(None, model, weights_sd, dtype=None, device=device)
         else:
-            network = lora_module.create_arch_network_from_weights(lora_multiplier, weights_sd, unet=model, for_inference=True)
+            native_module = lora_module
+            if net_type == "boft":
+                if lora_module.__name__.endswith("lora_flux_2"):
+                    from musubi_tuner.networks import boft_flux_2 as native_module
+                else:
+                    raise ValueError("Native BOFT inference is only supported for FLUX.2 Klein in this implementation")
+
+            network = native_module.create_arch_network_from_weights(lora_multiplier, weights_sd, unet=model, for_inference=True)
             network.merge_to(None, model, weights_sd, device=device, non_blocking=True)
 
         synchronize_device(device)
