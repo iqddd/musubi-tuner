@@ -20,6 +20,7 @@ from musubi_tuner.qwen_image import qwen_image_model, qwen_image_utils
 from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
 from musubi_tuner.qwen_image.qwen_image_autoencoder_kl import AutoencoderKLQwenImage
 from musubi_tuner.qwen_image.qwen_image_utils import VAE_SCALE_FACTOR
+from musubi_tuner.utils.argparse_utils import parse_bool
 from musubi_tuner.utils import model_utils
 from musubi_tuner.utils.lora_utils import filter_lora_state_dict
 
@@ -263,7 +264,7 @@ def parse_prompt_line(line: str) -> Dict[str, Any]:
         elif option == "rcm_th":
             overrides["rcm_threshold"] = float(value)
         elif option == "rcm_rel_th":
-            overrides["rcm_relative_threshold"] = value.lower() in ("1", "true", "yes")
+            overrides["rcm_relative_threshold"] = parse_bool(value)
         elif option == "rcm_ks":
             overrides["rcm_kernel_size"] = int(value)
         elif option == "rcm_ds":

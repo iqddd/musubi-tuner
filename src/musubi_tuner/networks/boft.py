@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from musubi_tuner.networks import lora as lora_module
+from musubi_tuner.utils.argparse_utils import parse_bool
 
 logger = logging.getLogger(__name__)
 
@@ -43,14 +44,6 @@ def butterfly_factor(dimension: int, factor: int = -1) -> tuple[int, int]:
     if block_num == 0 or block_size is None:
         raise ValueError(f"BOFT cannot decompose dimension={dimension} with network_dim={factor}")
     return block_size, block_num
-
-
-def _bool_arg(value) -> bool:
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return False
-    return str(value).lower() == "true"
 
 
 def _stage_count(block_num: int) -> int:
@@ -191,9 +184,12 @@ class BOFTModule(torch.nn.Module):
         super().__init__()
         self.lora_name = lora_name
         self.lora_dim = lora_dim
+        multiplier = float(multiplier)
 
         if org_module.__class__.__name__ != "Linear":
             raise ValueError("BOFT only supports Linear in this implementation")
+        if type(self) is BOFTModule and multiplier != 1.0:
+            raise ValueError("BOFT training path only supports multiplier=1.0; scaled BOFT is only supported for inference/merge")
 
         if type(alpha) == torch.Tensor:
             alpha = alpha.detach().float().item()
@@ -202,7 +198,7 @@ class BOFTModule(torch.nn.Module):
         layout = None if module_layouts is None else module_layouts.get(lora_name)
         if layout is None:
             block_size, block_num = butterfly_factor(org_module.out_features, int(lora_dim))
-            rescaled = _bool_arg(rescaled)
+            rescaled = parse_bool(rescaled)
             train_representation = str(train_representation).lower()
         else:
             block_size = int(layout["block_size"])
@@ -277,20 +273,27 @@ class BOFTModule(torch.nn.Module):
     def skew_oft_blocks(self) -> torch.Tensor:
         return self._expand_oft_blocks(signed=True)
 
-    def get_diff_weight(self, multiplier=None):
-        if multiplier is None:
-            multiplier = self.multiplier
-        org_weight = get_linear_weight(self.org_module_ref[0]).to(torch.float)
-        return (
-            apply_boft_to_weight(
-            org_weight,
-            self.skew_oft_blocks().to(torch.float),
+    def _transform_weight(self, weight: torch.Tensor, scale: float) -> torch.Tensor:
+        return apply_boft_to_weight(
+            weight,
+            self.skew_oft_blocks(),
             self.alpha,
-            scale=multiplier,
+            scale=scale,
             rescale=self._rescale_param(),
-            )
-            - org_weight
-        ) * multiplier
+        )
+
+    def _transform_activation(self, projected: torch.Tensor, scale: float) -> torch.Tensor:
+        return apply_boft_lastdim(
+            projected,
+            self.skew_oft_blocks(),
+            self.alpha,
+            scale=scale,
+            rescale=self._rescale_param(),
+        )
+
+    def get_diff_weight(self):
+        org_weight = get_linear_weight(self.org_module_ref[0]).to(torch.float)
+        return self._transform_weight(org_weight, scale=1.0) - org_weight
 
     def _forward_activation_path(self, x):
         org_forwarded = self.org_forward(x)
@@ -301,13 +304,9 @@ class BOFTModule(torch.nn.Module):
 
         bias = self.org_module_ref[0].bias
         projected = org_forwarded if bias is None else org_forwarded - bias.to(device=org_forwarded.device, dtype=org_forwarded.dtype)
-        transformed = apply_boft_lastdim(
-            projected,
-            self.skew_oft_blocks(),
-            self.alpha,
-            scale=self.multiplier,
-            rescale=self._rescale_param(),
-        )
+        transformed = self._transform_activation(projected, scale=self.multiplier)
+        if self.multiplier == 1.0:
+            return transformed + (bias.to(device=transformed.device, dtype=transformed.dtype) if bias is not None else 0)
         return org_forwarded + (transformed - projected) * self.multiplier
 
     def _forward_weight_path(self, x):
@@ -318,14 +317,7 @@ class BOFTModule(torch.nn.Module):
         org_module = self.org_module_ref[0]
         base_weight = get_linear_weight(org_module)
         base_weight = base_weight.to(device=x.device)
-        skew_blocks = self.skew_oft_blocks()
-        transformed_weight = apply_boft_to_weight(
-            base_weight,
-            skew_blocks,
-            self.alpha,
-            scale=self.multiplier,
-            rescale=self._rescale_param(),
-        )
+        transformed_weight = self._transform_weight(base_weight, scale=self.multiplier)
         if self.multiplier == 1.0:
             effective_weight = transformed_weight
         else:
@@ -380,16 +372,15 @@ class BOFTInfModule(BOFTModule):
         org_sd["weight"] = (weight + diff_weight).to(org_device, dtype=dtype)
         self.org_module.load_state_dict(org_sd)
 
+    def get_diff_weight(self, multiplier=None):
+        if multiplier is None:
+            multiplier = self.multiplier
+        org_weight = get_linear_weight(self.org_module_ref[0]).to(torch.float)
+        transformed_weight = self._transform_weight(org_weight, scale=multiplier)
+        return (transformed_weight - org_weight) * multiplier
+
     def get_weight(self, multiplier=None):
         return self.get_diff_weight(self.multiplier if multiplier is None else multiplier)
-
-    def default_forward(self, x):
-        return super().forward(x)
-
-    def forward(self, x):
-        if not self.enabled:
-            return self.org_forward(x)
-        return self.default_forward(x)
 
 
 class BOFTNetwork(lora_module.LoRANetwork):
@@ -472,7 +463,7 @@ def create_network(
     if module_dropout is not None:
         module_dropout = float(module_dropout)
 
-    verbose = _bool_arg(kwargs.get("verbose", False))
+    verbose = parse_bool(kwargs.get("verbose", False))
 
     exclude_patterns = kwargs.get("exclude_patterns", None)
     if exclude_patterns is not None and isinstance(exclude_patterns, str):
@@ -575,7 +566,7 @@ def create_arch_network(
         exclude_patterns = ast.literal_eval(exclude_patterns)
     kwargs["exclude_patterns"] = exclude_patterns
 
-    rescaled = _bool_arg(kwargs.pop("rescaled", False))
+    rescaled = parse_bool(kwargs.pop("rescaled", False))
     train_representation = str(kwargs.pop("train_representation", "full")).lower()
     forward_path = str(kwargs.pop("forward_path", "weight")).lower()
     module_kwargs = {"rescaled": rescaled, "train_representation": train_representation, "forward_path": forward_path}

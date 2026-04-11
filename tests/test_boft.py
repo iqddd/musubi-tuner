@@ -14,6 +14,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from musubi_tuner.networks.boft import (
+    BOFTInfModule,
     BOFTModule,
     create_network,
     boft_diff_from_weight,
@@ -75,7 +76,7 @@ class TestBOFT(unittest.TestCase):
         x = torch.randn(2, 5, 12)
         expected = linear(x)
 
-        module = BOFTModule("test", linear, multiplier=0.7, lora_dim=32, alpha=0.2, rescaled=True)
+        module = BOFTModule("test", linear, multiplier=1.0, lora_dim=32, alpha=0.2, rescaled=True)
         module.apply_to()
         actual = linear(x)
 
@@ -84,14 +85,14 @@ class TestBOFT(unittest.TestCase):
     def test_forward_matches_weight_space_boft(self):
         torch.manual_seed(1)
         linear = torch.nn.Linear(10, 3072, bias=True)
-        module = BOFTModule("test", linear, multiplier=0.7, lora_dim=32, alpha=0.2, rescaled=True)
+        module = BOFTModule("test", linear, multiplier=1.0, lora_dim=32, alpha=0.2, rescaled=True)
         with torch.no_grad():
             module.oft_blocks.normal_(0, 0.01)
             module.rescale.fill_(1.01)
 
         x = torch.randn(4, 10)
         base_weight = linear.weight.detach().clone()
-        diff = boft_diff_from_weight(base_weight, module.export_oft_blocks(), module.alpha, 0.7, module.rescale)
+        diff = boft_diff_from_weight(base_weight, module.export_oft_blocks(), module.alpha, 1.0, module.rescale)
         expected = torch.nn.functional.linear(x, base_weight + diff, linear.bias)
 
         module.apply_to()
@@ -99,10 +100,15 @@ class TestBOFT(unittest.TestCase):
 
         self.assertTrue(torch.allclose(expected, actual, atol=1e-5, rtol=1e-5))
 
+    def test_training_module_rejects_scaled_multiplier(self):
+        linear = torch.nn.Linear(10, 3072, bias=True)
+        with self.assertRaises(ValueError):
+            BOFTModule("test", linear, multiplier=0.7, lora_dim=32, alpha=0.2, rescaled=True)
+
     def test_merge_weights_to_tensor_consumes_export_keys(self):
         torch.manual_seed(2)
         linear = torch.nn.Linear(16, 3072, bias=False)
-        module = BOFTModule("test", linear, multiplier=0.5, lora_dim=32, alpha=0.1, rescaled=True)
+        module = BOFTModule("test", linear, multiplier=1.0, lora_dim=32, alpha=0.1, rescaled=True)
         with torch.no_grad():
             module.oft_blocks.normal_(0, 0.01)
             module.rescale.fill_(1.02)
@@ -121,6 +127,30 @@ class TestBOFT(unittest.TestCase):
 
         self.assertTrue(torch.allclose(expected, merged, atol=1e-5, rtol=1e-5))
         self.assertEqual(keys, set())
+
+    def test_inference_module_scaled_merge_matches_weight_space_boft(self):
+        torch.manual_seed(6)
+        linear = torch.nn.Linear(16, 3072, bias=False)
+        module = BOFTModule("test", linear, multiplier=1.0, lora_dim=32, alpha=0.1, rescaled=True)
+        with torch.no_grad():
+            module.oft_blocks.normal_(0, 0.01)
+            module.rescale.fill_(1.02)
+
+        inference_linear = torch.nn.Linear(16, 3072, bias=False)
+        inference_linear.load_state_dict(linear.state_dict())
+        inference_module = BOFTInfModule("test", inference_linear, multiplier=0.5, lora_dim=32, alpha=0.1, rescaled=True)
+        state_dict = {
+            "oft_blocks": module.export_oft_blocks().detach().clone(),
+            "rescale": module.rescale.detach().clone(),
+            "alpha": module.alpha.detach().clone(),
+        }
+
+        weight = linear.weight.detach().clone()
+        expected = weight + boft_diff_from_weight(weight, state_dict["oft_blocks"], state_dict["alpha"], 0.5, state_dict["rescale"])
+        inference_module.merge_to(state_dict, dtype=None, device=torch.device("cpu"))
+        merged = inference_linear.weight.detach().clone()
+
+        self.assertTrue(torch.allclose(expected, merged, atol=1e-5, rtol=1e-5))
 
     def test_detect_network_type_returns_boft(self):
         detect_network_type = import_detect_network_type()
@@ -145,11 +175,11 @@ class TestBOFT(unittest.TestCase):
         linear_packed = torch.nn.Linear(10, 3072, bias=True)
         linear_packed.load_state_dict(linear_full.state_dict())
 
-        module_full = BOFTModule("test_full", linear_full, multiplier=0.7, lora_dim=32, alpha=0.2, rescaled=True)
+        module_full = BOFTModule("test_full", linear_full, multiplier=1.0, lora_dim=32, alpha=0.2, rescaled=True)
         module_packed = BOFTModule(
             "test_packed",
             linear_packed,
-            multiplier=0.7,
+            multiplier=1.0,
             lora_dim=32,
             alpha=0.2,
             rescaled=True,
