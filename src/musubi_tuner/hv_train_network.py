@@ -379,6 +379,31 @@ class NetworkTrainer:
         self.num_timestep_buckets: Optional[int] = None  # for get_bucketed_timestep()
         self.vae_frame_stride = 4  # all architectures require frames to be divisible by 4, except Qwen-Image-Layered
         self.default_discrete_flow_shift = 14.5  # default value for discrete flow shift for all models TODO may be None is better
+        self._sampling_network = None
+
+    def _prepare_transformer_for_sampling(self, args: argparse.Namespace, transformer: torch.nn.Module) -> dict:
+        state = {
+            "gradient_checkpointing": False,
+            "gradient_checkpointing_cpu_offload": False,
+        }
+
+        if hasattr(transformer, "gradient_checkpointing") and hasattr(transformer, "disable_gradient_checkpointing"):
+            state["gradient_checkpointing"] = bool(getattr(transformer, "gradient_checkpointing", False))
+            state["gradient_checkpointing_cpu_offload"] = bool(getattr(transformer, "activation_cpu_offloading", False))
+            if state["gradient_checkpointing"]:
+                transformer.disable_gradient_checkpointing()
+
+        transformer.switch_block_swap_for_inference()
+        return state
+
+    def _restore_transformer_after_sampling(self, transformer: torch.nn.Module, state: dict):
+        if state.get("gradient_checkpointing") and hasattr(transformer, "enable_gradient_checkpointing"):
+            try:
+                transformer.enable_gradient_checkpointing(state.get("gradient_checkpointing_cpu_offload", False))
+            except TypeError:
+                transformer.enable_gradient_checkpointing()
+
+        transformer.switch_block_swap_for_training()
 
     # TODO 他のスクリプトと共通化する
     def generate_step_logs(
@@ -1089,7 +1114,10 @@ class NetworkTrainer:
 
         # Use the unwrapped model
         transformer = accelerator.unwrap_model(transformer)
-        transformer.switch_block_swap_for_inference()
+        transformer_sampling_state = self._prepare_transformer_for_sampling(args, transformer)
+        network_sampling_state = None
+        if self._sampling_network is not None:
+            network_sampling_state = self._sampling_network.prepare_for_sampling()
 
         # Create a directory to save the samples
         save_dir = os.path.join(args.output_dir, "sample")
@@ -1103,34 +1131,38 @@ class NetworkTrainer:
         except Exception:
             pass
 
-        if distributed_state.num_processes <= 1:
-            # If only one device is available, just use the original prompt list. We don't need to care about the distribution of prompts.
-            with torch.no_grad(), accelerator.autocast():
-                for sample_parameter in sample_parameters:
-                    self.sample_image_inference(
-                        accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps
-                    )
-                    clean_memory_on_device(accelerator.device)
-        else:
-            # Creating list with N elements, where each element is a list of prompt_dicts, and N is the number of processes available (number of devices available)
-            # prompt_dicts are assigned to lists based on order of processes, to attempt to time the image creation time to match enum order. Probably only works when steps and sampler are identical.
-            per_process_params = []  # list of lists
-            for i in range(distributed_state.num_processes):
-                per_process_params.append(sample_parameters[i :: distributed_state.num_processes])
-
-            with torch.no_grad():
-                with distributed_state.split_between_processes(per_process_params) as sample_parameter_lists:
-                    for sample_parameter in sample_parameter_lists[0]:
+        try:
+            if distributed_state.num_processes <= 1:
+                # If only one device is available, just use the original prompt list. We don't need to care about the distribution of prompts.
+                with torch.no_grad(), accelerator.autocast():
+                    for sample_parameter in sample_parameters:
                         self.sample_image_inference(
                             accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps
                         )
                         clean_memory_on_device(accelerator.device)
+            else:
+                # Creating list with N elements, where each element is a list of prompt_dicts, and N is the number of processes available (number of devices available)
+                # prompt_dicts are assigned to lists based on order of processes, to attempt to time the image creation time to match enum order. Probably only works when steps and sampler are identical.
+                per_process_params = []  # list of lists
+                for i in range(distributed_state.num_processes):
+                    per_process_params.append(sample_parameters[i :: distributed_state.num_processes])
+
+                with torch.no_grad():
+                    with distributed_state.split_between_processes(per_process_params) as sample_parameter_lists:
+                        for sample_parameter in sample_parameter_lists[0]:
+                            self.sample_image_inference(
+                                accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps
+                            )
+                            clean_memory_on_device(accelerator.device)
+        finally:
+            if self._sampling_network is not None:
+                self._sampling_network.finish_sampling(network_sampling_state)
+            self._restore_transformer_after_sampling(transformer, transformer_sampling_state)
 
         torch.set_rng_state(rng_state)
         if cuda_rng_state is not None:
             torch.cuda.set_rng_state(cuda_rng_state)
 
-        transformer.switch_block_swap_for_training()
         clean_memory_on_device(accelerator.device)
 
     def sample_image_inference(self, accelerator, args, transformer, dit_dtype, vae, save_dir, sample_parameter, epoch, steps):
@@ -1931,6 +1963,7 @@ class NetworkTrainer:
 
         network, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(network, optimizer, train_dataloader, lr_scheduler)
         training_model = network
+        self._sampling_network = accelerator.unwrap_model(network)
 
         if args.gradient_checkpointing:
             transformer.train()

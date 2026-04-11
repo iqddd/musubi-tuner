@@ -746,6 +746,12 @@ class LoRANetwork(torch.nn.Module):
         # not supported
         pass
 
+    def prepare_for_sampling(self):
+        return None
+
+    def finish_sampling(self, state):
+        pass
+
     def prepare_grad_etc(self, unet):
         self.requires_grad_(True)
 
