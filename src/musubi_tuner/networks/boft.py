@@ -384,6 +384,24 @@ class BOFTInfModule(BOFTModule):
 
 
 class BOFTNetwork(lora_module.LoRANetwork):
+    def prepare_for_sampling(self):
+        state = []
+        for module in self.text_encoder_loras + self.unet_loras:
+            if isinstance(module, BOFTModule) and module.use_weight_forward:
+                state.append((module, True))
+                module.use_weight_forward = False
+
+        if len(state) > 0:
+            logger.info(f"BOFT: switched {len(state)} modules to activation path for sampling")
+        return state
+
+    def finish_sampling(self, state):
+        if not state:
+            return
+
+        for module, use_weight_forward in state:
+            module.use_weight_forward = use_weight_forward
+
     def _export_state_dict(self, dtype: Optional[torch.dtype] = None) -> Dict[str, torch.Tensor]:
         state_dict: Dict[str, torch.Tensor] = {}
         for module in self.text_encoder_loras + self.unet_loras:
