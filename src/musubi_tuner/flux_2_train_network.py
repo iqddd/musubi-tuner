@@ -6,6 +6,7 @@ import torch
 from accelerate import Accelerator
 from einops import rearrange
 from diffusers.utils.torch_utils import randn_tensor
+from safetensors.torch import load_file
 
 from musubi_tuner.flux_2 import flux2_models, flux2_utils
 from musubi_tuner.hv_train_network import (
@@ -226,6 +227,19 @@ class Flux2NetworkTrainer(NetworkTrainer):
         ae = flux2_utils.load_ae(vae_path, dtype=vae_dtype, device="cpu", disable_mmap=True)
         return ae
 
+    def load_base_weights_for_merge(self, args: argparse.Namespace):
+        if args.base_weights is None or len(args.base_weights) == 0:
+            return None, None
+
+        lora_weights_list = []
+        for weight_path in args.base_weights:
+            logger.info(f"Loading base network weights for pre-quantization merge: {weight_path}")
+            weights_sd = load_file(weight_path)
+            weights_sd = self.convert_weight_keys(weights_sd, args.network_module)
+            lora_weights_list.append(weights_sd)
+
+        return lora_weights_list, args.base_weights_multiplier
+
     def load_transformer(
         self,
         accelerator: Accelerator,
@@ -236,6 +250,11 @@ class Flux2NetworkTrainer(NetworkTrainer):
         loading_device: str,
         dit_weight_dtype: Optional[torch.dtype],
     ):
+        if args.fp8_scaled:
+            lora_weights_list, lora_multipliers = self.load_base_weights_for_merge(args)
+        else:
+            lora_weights_list, lora_multipliers = None, None
+
         model = flux2_utils.load_flow_model(
             accelerator.device,
             model_version_info=self.model_version_info,
@@ -245,8 +264,16 @@ class Flux2NetworkTrainer(NetworkTrainer):
             loading_device=loading_device,
             dit_weight_dtype=dit_weight_dtype,
             fp8_scaled=args.fp8_scaled,
+            lora_weights_list=lora_weights_list,
+            lora_multipliers=lora_multipliers,
             disable_numpy_memmap=args.disable_numpy_memmap,
         )
+
+        if lora_weights_list is not None:
+            logger.info("Merged base network weights into FLUX.2 DiT during model loading")
+            args.base_weights = None
+            args.base_weights_multiplier = None
+
         return model
 
     def compile_transformer(self, args, transformer):

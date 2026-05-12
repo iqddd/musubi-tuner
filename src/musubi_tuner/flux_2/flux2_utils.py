@@ -447,7 +447,7 @@ def load_flow_model(
     loading_device: Union[str, torch.device],
     dit_weight_dtype: Optional[torch.dtype] = None,
     fp8_scaled: bool = False,
-    lora_weights_list: Optional[dict[str, torch.Tensor]] = None,
+    lora_weights_list: Optional[list[dict[str, torch.Tensor]]] = None,
     lora_multipliers: Optional[list[float]] = None,
     disable_numpy_memmap: bool = False,
 ) -> flux2_models.Flux2:
