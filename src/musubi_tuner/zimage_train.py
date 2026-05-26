@@ -534,6 +534,7 @@ class ZImageTrainer(ZImageNetworkTrainer):
 
                     if weighting is not None:
                         loss = loss * weighting
+                    loss = train_utils.apply_alpha_masked_loss(loss, batch)
 
                     loss = loss.mean()  # mean loss over all elements in batch
 

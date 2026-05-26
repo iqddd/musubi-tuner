@@ -444,6 +444,9 @@ def encode_datasets_framepack(datasets: list[BaseDataset], encode: callable, arg
         for _, batch in tqdm(dataset.retrieve_latent_cache_batches(num_workers)):
             batch: list[ItemInfo] = batch  # type: ignore
 
+            for item in batch:
+                cache_latents.set_alpha_mask_for_image_item(item)
+
             # make sure content has 3 channels
             for item in batch:
                 if isinstance(item.content, np.ndarray):

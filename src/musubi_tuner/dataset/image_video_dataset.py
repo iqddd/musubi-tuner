@@ -199,6 +199,7 @@ class ItemInfo:
 
         # np.ndarray for video, list[np.ndarray] for image with multiple controls
         self.control_content: Optional[Union[np.ndarray, list[np.ndarray]]] = None
+        self.alpha_mask: Optional[torch.Tensor] = None
 
         # FramePack architecture specific
         self.fp_latent_window_size: Optional[int] = None
@@ -223,6 +224,11 @@ class ItemInfo:
 # and `<content_type>_<dtype|mask>` for other tensors
 
 
+def add_alpha_mask_to_latent_cache(item_info: ItemInfo, sd: dict[str, torch.Tensor]):
+    if item_info.alpha_mask is not None:
+        sd["alpha_mask"] = item_info.alpha_mask.detach().cpu().float().contiguous()
+
+
 def save_latent_cache(item_info: ItemInfo, latent: torch.Tensor):
     """HunyuanVideo architecture. HunyuanVideo doesn't support I2V and control latents"""
     assert latent.dim() == 4, "latent should be 4D tensor (frame, channel, height, width)"
@@ -230,6 +236,7 @@ def save_latent_cache(item_info: ItemInfo, latent: torch.Tensor):
     _, F, H, W = latent.shape
     dtype_str = dtype_to_str(latent.dtype)
     sd = {f"latents_{F}x{H}x{W}_{dtype_str}": latent.detach().cpu()}
+    add_alpha_mask_to_latent_cache(item_info, sd)
 
     save_latent_cache_common(item_info, sd, ARCHITECTURE_HUNYUAN_VIDEO_FULL)
 
@@ -262,6 +269,7 @@ def save_latent_cache_wan(
         dtype_str = dtype_to_str(torch.int32)
         sd[f"f_indices_{dtype_str}"] = torch.tensor(f_indices, dtype=torch.int32)
 
+    add_alpha_mask_to_latent_cache(item_info, sd)
     save_latent_cache_common(item_info, sd, ARCHITECTURE_WAN_FULL)
 
 
@@ -299,6 +307,7 @@ def save_latent_cache_framepack(
     if clean_latents_4x is not None:
         sd[f"latents_clean_4x_{F}x{H}x{W}_{dtype_str}"] = clean_latents_4x.detach().cpu().contiguous()
 
+    add_alpha_mask_to_latent_cache(item_info, sd)
     # for key, value in sd.items():
     #     print(f"{key}: {value.shape}")
     save_latent_cache_common(item_info, sd, ARCHITECTURE_FRAMEPACK_FULL)
@@ -321,6 +330,7 @@ def save_latent_cache_flux_kontext(
     F = 1
     sd[f"latents_control_{F}x{H}x{W}_{dtype_str}"] = control_latent.detach().cpu().contiguous()
 
+    add_alpha_mask_to_latent_cache(item_info, sd)
     save_latent_cache_common(item_info, sd, ARCHITECTURE_FLUX_KONTEXT_FULL)
 
 
@@ -342,6 +352,7 @@ def save_latent_cache_flux_2(
             _, H, W = cl.shape
             sd[f"latents_control_{i}_{H}x{W}_{dtype_str}"] = cl.detach().cpu().contiguous()
 
+    add_alpha_mask_to_latent_cache(item_info, sd)
     save_latent_cache_common(item_info, sd, arch_full)
 
 
@@ -361,6 +372,7 @@ def save_latent_cache_qwen_image(item_info: ItemInfo, latent: torch.Tensor, cont
             _, F, H, W = cl.shape
             sd[f"latents_control_{i}_{F}x{H}x{W}_{dtype_str}"] = cl.detach().cpu().contiguous()
 
+    add_alpha_mask_to_latent_cache(item_info, sd)
     save_latent_cache_common(item_info, sd, ARCHITECTURE_QWEN_IMAGE_FULL)
 
 
@@ -393,6 +405,7 @@ def save_latent_cache_kandinsky5(
     if scaling_factor is not None:
         sd["vae_scaling_factor"] = torch.tensor(float(scaling_factor))
 
+    add_alpha_mask_to_latent_cache(item_info, sd)
     save_latent_cache_common(item_info, sd, ARCHITECTURE_KANDINSKY5_FULL)
 
 
@@ -416,6 +429,7 @@ def save_latent_cache_hunyuan_video_1_5(
         dtype_str = dtype_to_str(vision_feature.dtype)
         sd[f"siglip_{dtype_str}"] = vision_feature.detach().cpu()
 
+    add_alpha_mask_to_latent_cache(item_info, sd)
     save_latent_cache_common(item_info, sd, ARCHITECTURE_HUNYUAN_VIDEO_1_5_FULL)
 
 
@@ -428,6 +442,7 @@ def save_latent_cache_z_image(item_info: ItemInfo, latent: torch.Tensor):
     dtype_str = dtype_to_str(latent.dtype)
     sd = {f"latents_{F}x{H}x{W}_{dtype_str}": latent.detach().cpu().contiguous()}
 
+    add_alpha_mask_to_latent_cache(item_info, sd)
     save_latent_cache_common(item_info, sd, ARCHITECTURE_Z_IMAGE_FULL)
 
 

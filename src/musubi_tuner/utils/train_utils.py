@@ -5,6 +5,7 @@ import shutil
 from typing import Callable
 
 import accelerate
+import torch
 
 from musubi_tuner.utils import huggingface_utils
 
@@ -77,6 +78,49 @@ class LossRecorder:
     @property
     def moving_average(self) -> float:
         return self.loss_total / len(self.loss_list)
+
+
+def resize_spatial_mask(mask: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
+    leading_shape = mask.shape[:-2]
+    mask = mask.reshape(-1, 1, mask.shape[-2], mask.shape[-1])
+    mask = torch.nn.functional.interpolate(mask, size=size, mode="area")
+    return mask.reshape(*leading_shape, *size)
+
+
+def apply_alpha_masked_loss(loss: torch.Tensor, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+    alpha_mask = batch.get("alpha_mask")
+    if alpha_mask is None:
+        return loss
+
+    if alpha_mask.shape[0] != loss.shape[0]:
+        raise ValueError(f"alpha_mask batch size {alpha_mask.shape[0]} does not match loss batch size {loss.shape[0]}")
+
+    alpha_mask = alpha_mask.to(device=loss.device, dtype=loss.dtype)
+
+    if loss.ndim == 4:
+        # loss: B,C,H,W. If a multi-target mask slips in, use the first target.
+        if alpha_mask.ndim == 4:
+            alpha_mask = alpha_mask[:, 0]
+        alpha_mask = resize_spatial_mask(alpha_mask, loss.shape[-2:]).unsqueeze(1)
+        return loss * alpha_mask
+
+    if loss.ndim == 5:
+        if alpha_mask.ndim == 3:
+            # loss is usually B,C,F,H,W, but this also broadcasts over layered B,L,C,H,W.
+            alpha_mask = resize_spatial_mask(alpha_mask, loss.shape[-2:]).unsqueeze(1).unsqueeze(1)
+        elif alpha_mask.ndim == 4:
+            alpha_mask = resize_spatial_mask(alpha_mask, loss.shape[-2:])
+            if alpha_mask.shape[1] == loss.shape[1]:
+                # layered image layout: B,L,C,H,W
+                alpha_mask = alpha_mask.unsqueeze(2)
+            else:
+                # video/latent-frame layout: B,C,F,H,W
+                alpha_mask = alpha_mask.unsqueeze(1)
+        else:
+            raise ValueError(f"alpha_mask must be 3D or 4D for 5D loss, got shape {alpha_mask.shape}")
+        return loss * alpha_mask
+
+    raise ValueError(f"alpha masked loss supports 4D or 5D loss tensors, got shape {loss.shape}")
 
 
 def get_epoch_ckpt_name(model_name, epoch_no: int):
