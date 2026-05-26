@@ -20,6 +20,33 @@ from musubi_tuner.utils.model_utils import str_to_dtype
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
+ALPHA_MASK_EXTENSIONS = {".png", ".webp"}
+
+
+def set_alpha_mask_for_image_item(item: ItemInfo):
+    if item.frame_count is not None or item.content is None:
+        return
+
+    contents = item.content if isinstance(item.content, list) else [item.content]
+    use_image_alpha = os.path.splitext(item.item_key)[1].lower() in ALPHA_MASK_EXTENSIONS
+    alpha_masks = []
+
+    for content in contents:
+        if content is None:
+            continue
+
+        height, width = content.shape[:2]
+        if use_image_alpha and content.ndim == 3 and content.shape[-1] == 4:
+            alpha_mask = torch.from_numpy(content[..., 3].copy()).float() / 255.0
+        else:
+            alpha_mask = torch.ones((height, width), dtype=torch.float32)
+        alpha_masks.append(alpha_mask)
+
+    if len(alpha_masks) == 1:
+        item.alpha_mask = alpha_masks[0]
+    elif len(alpha_masks) > 1:
+        item.alpha_mask = torch.stack(alpha_masks)
+
 
 def show_image(
     image: Union[list[Union[Image.Image, np.ndarray], Union[Image.Image, np.ndarray]]],
@@ -292,6 +319,9 @@ def encode_datasets(datasets: list[BaseDataset], encode: callable, args: argpars
         all_latent_cache_paths = []
         for _, batch in tqdm(dataset.retrieve_latent_cache_batches(num_workers)):
             batch: list[ItemInfo] = batch
+            for item in batch:
+                set_alpha_mask_for_image_item(item)
+
             if not supports_alpha:
                 # make sure content has 3 channels
                 for item in batch:

@@ -1086,6 +1086,7 @@ class FineTuningTrainer:
 
                     if weighting is not None:
                         loss = loss * weighting
+                    loss = train_utils.apply_alpha_masked_loss(loss, batch)
                     # loss = loss.mean([1, 2, 3])
                     # # min snr gamma, scale v pred loss like noise pred, v pred like loss, debiased estimation etc.
                     # loss = self.post_process_loss(loss, args, timesteps, noise_scheduler)

@@ -14,7 +14,7 @@ from musubi_tuner.ideogram4.sampler_configs import PRESETS
 from musubi_tuner.training.parser_common import read_config_from_file, setup_parser_common
 from musubi_tuner.training.sampling_prompts import load_prompts
 from musubi_tuner.training.trainer_base import DiTOutput, NetworkTrainer
-from musubi_tuner.utils import model_utils
+from musubi_tuner.utils import model_utils, train_utils
 from musubi_tuner.utils.device_utils import clean_memory_on_device
 
 logger = logging.getLogger(__name__)
@@ -330,6 +330,7 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
         dit_dtype: torch.dtype,
         network_dtype: torch.dtype,
         global_step: int,
+        batch: dict[str, torch.Tensor],
     ) -> tuple[torch.Tensor, dict[str, float]]:
         # Plain mean MSE in flow-matching velocity space. Ideogram 4 does not use the
         # SD3 weighting_scheme, so this owns the full loss formulation rather than
@@ -337,7 +338,8 @@ class Ideogram4NetworkTrainer(NetworkTrainer):
         del noise_scheduler, dit_dtype, global_step
         pred = output.pred.to(network_dtype)
         target = output.target.to(network_dtype)
-        loss = torch.nn.functional.mse_loss(pred, target, reduction="mean")
+        loss = torch.nn.functional.mse_loss(pred, target, reduction="none")
+        loss = train_utils.apply_alpha_masked_loss(loss, batch).mean()
 
         loss_metrics = {}
         if getattr(args, "log_loss_stats", False):

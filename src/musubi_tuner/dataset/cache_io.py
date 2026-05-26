@@ -37,6 +37,11 @@ logger = logging.getLogger(__name__)
 # and `<content_type>_<dtype|mask>` for other tensors
 
 
+def add_alpha_mask_to_latent_cache(item_info: ItemInfo, sd: dict[str, torch.Tensor]) -> None:
+    if item_info.alpha_mask is not None:
+        sd["alpha_mask"] = item_info.alpha_mask.detach().cpu().float().contiguous()
+
+
 def save_latent_cache(item_info: ItemInfo, latent: torch.Tensor):
     """HunyuanVideo architecture. HunyuanVideo doesn't support I2V and control latents"""
     assert latent.dim() == 4, "latent should be 4D tensor (frame, channel, height, width)"
@@ -303,6 +308,7 @@ def save_latent_cache_ideogram4(item_info: ItemInfo, latent: torch.Tensor):
 
 
 def save_latent_cache_common(item_info: ItemInfo, sd: dict[str, torch.Tensor], arch_fullname: str):
+    add_alpha_mask_to_latent_cache(item_info, sd)
     metadata = {
         "architecture": arch_fullname,
         "width": f"{item_info.original_size[0]}",
