@@ -313,6 +313,17 @@ def _add_optimizer_args(parser: argparse.ArgumentParser) -> None:
         nargs="*",
         help='additional arguments for optimizer (like "weight_decay=0.01 betas=0.9,0.999 ...") / オプティマイザの追加引数（例： "weight_decay=0.01 betas=0.9,0.999 ..."）',
     )
+    parser.add_argument(
+        "--optimizer_group_patterns",
+        type=str,
+        default=None,
+        nargs="*",
+        help=(
+            'split trainable params into optimizer param groups by regex over full parameter names, '
+            'for example "name=rescale,pattern=.*\\\\.rescale$". '
+            "Only name and pattern are supported; all groups share the same LR."
+        ),
+    )
     parser.add_argument("--learning_rate", type=float, default=2.0e-6, help="learning rate / 学習率")
     parser.add_argument(
         "--max_grad_norm",

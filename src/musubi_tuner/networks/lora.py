@@ -20,6 +20,43 @@ logging.basicConfig(level=logging.INFO)
 HUNYUAN_TARGET_REPLACE_MODULES = ["MMDoubleStreamBlock", "MMSingleStreamBlock"]
 
 
+def parse_optimizer_group_patterns(group_specs: Optional[List[str]]) -> List[Dict[str, Any]]:
+    if not group_specs:
+        return []
+
+    compiled_groups = []
+    for spec in group_specs:
+        config = {}
+        for item in spec.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if "=" not in item:
+                raise ValueError(
+                    f"Invalid optimizer_group_patterns entry {spec!r}. Expected comma-separated key=value pairs."
+                )
+            key, value = item.split("=", 1)
+            config[key.strip()] = value.strip()
+
+        unknown_keys = set(config.keys()) - {"name", "pattern"}
+        if unknown_keys:
+            raise ValueError(
+                f"Unsupported optimizer_group_patterns keys {sorted(unknown_keys)} in {spec!r}. "
+                "Only 'name' and 'pattern' are supported."
+            )
+        if "name" not in config or "pattern" not in config:
+            raise ValueError(f"optimizer_group_patterns entry {spec!r} must include both name=... and pattern=...")
+
+        try:
+            pattern = re.compile(config["pattern"])
+        except re.error as e:
+            raise ValueError(f"Invalid optimizer_group_patterns regex {config['pattern']!r}: {e}") from e
+
+        compiled_groups.append({"name": config["name"], "pattern": pattern})
+
+    return compiled_groups
+
+
 class LoRAModule(torch.nn.Module):
     """
     replaces forward method of the original Linear, instead of replacing the original Linear module.
@@ -781,29 +818,46 @@ class LoRANetwork(torch.nn.Module):
 
         all_params = []
         lr_descriptions = []
+        optimizer_group_patterns = parse_optimizer_group_patterns(kwargs.get("optimizer_group_patterns"))
 
         def assemble_params(loras, lr, loraplus_ratio):
-            param_groups = {"lora": {}, "plus": {}}
+            param_groups = {}
+            pattern_match_counts = {group["name"]: 0 for group in optimizer_group_patterns}
+
+            def get_bucket(param_kind: str, group_name: str):
+                key = (param_kind, group_name)
+                if key not in param_groups:
+                    param_groups[key] = {}
+                return param_groups[key]
+
             for lora in loras:
                 for name, param in lora.named_parameters():
-                    if loraplus_ratio is not None and "lora_up" in name:
-                        param_groups["plus"][f"{lora.lora_name}.{name}"] = param
-                    else:
-                        param_groups["lora"][f"{lora.lora_name}.{name}"] = param
+                    full_name = f"{lora.lora_name}.{name}"
+                    param_kind = "plus" if loraplus_ratio is not None and "lora_up" in name else "lora"
+                    matched_group = "default"
+                    for group in optimizer_group_patterns:
+                        if group["pattern"].fullmatch(full_name):
+                            matched_group = group["name"]
+                            pattern_match_counts[group["name"]] += 1
+                            break
+                    get_bucket(param_kind, matched_group)[full_name] = param
 
-            if loraplus_ratio is not None and len(param_groups["plus"]) == 0:
+            if loraplus_ratio is not None and not any(kind == "plus" for kind, _ in param_groups.keys()):
                 logger.warning("LoRA+ is not effective for this network type (no 'lora_up' parameters found)")
+            for group_name, match_count in pattern_match_counts.items():
+                if match_count == 0:
+                    logger.warning(f"optimizer_group_patterns group {group_name!r} did not match any parameters")
 
             params = []
             descriptions = []
-            for key in param_groups.keys():
-                param_data = {"params": param_groups[key].values()}
+            for (param_kind, group_name), grouped_params in param_groups.items():
+                param_data = {"params": grouped_params.values()}
 
                 if len(param_data["params"]) == 0:
                     continue
 
                 if lr is not None:
-                    if key == "plus":
+                    if param_kind == "plus":
                         param_data["lr"] = lr * loraplus_ratio
                     else:
                         param_data["lr"] = lr
@@ -813,7 +867,12 @@ class LoRANetwork(torch.nn.Module):
                     continue
 
                 params.append(param_data)
-                descriptions.append("plus" if key == "plus" else "")
+                description_parts = []
+                if param_kind == "plus":
+                    description_parts.append("plus")
+                if group_name != "default":
+                    description_parts.append(group_name)
+                descriptions.append(" ".join(description_parts))
 
             return params, descriptions
 
