@@ -12,6 +12,7 @@ import sys
 import random
 import time
 import json
+from collections import defaultdict
 from multiprocessing import Value
 from typing import Any, Dict, List, Optional
 import accelerate
@@ -380,6 +381,113 @@ class NetworkTrainer:
         self.vae_frame_stride = 4  # all architectures require frames to be divisible by 4, except Qwen-Image-Layered
         self.default_discrete_flow_shift = 14.5  # default value for discrete flow shift for all models TODO may be None is better
         self._sampling_network = None
+
+    def _classify_rescale_group(self, parameter_name: str) -> str:
+        if "single_blocks" in parameter_name:
+            if parameter_name.endswith("linear1.rescale"):
+                return "single_linear1"
+            if parameter_name.endswith("linear2.rescale"):
+                return "single_linear2"
+        if "double_blocks" in parameter_name:
+            if "img_attn_qkv" in parameter_name:
+                return "double_img_attn_qkv"
+            if "img_attn_proj" in parameter_name:
+                return "double_img_attn_proj"
+            if "txt_attn_qkv" in parameter_name:
+                return "double_txt_attn_qkv"
+            if "txt_attn_proj" in parameter_name:
+                return "double_txt_attn_proj"
+            if "img_mlp_0" in parameter_name:
+                return "double_img_mlp_0"
+            if "img_mlp_2" in parameter_name:
+                return "double_img_mlp_2"
+            if "txt_mlp_0" in parameter_name:
+                return "double_txt_mlp_0"
+            if "txt_mlp_2" in parameter_name:
+                return "double_txt_mlp_2"
+        return "other"
+
+    def _collect_rescale_param_refs(self, network: torch.nn.Module) -> list[tuple[str, torch.nn.Parameter, str]]:
+        refs = []
+        for name, param in network.named_parameters():
+            if name.endswith(".rescale") and param.requires_grad:
+                refs.append((name, param, self._classify_rescale_group(name)))
+        return refs
+
+    def _snapshot_rescale_params(
+        self, rescale_refs: list[tuple[str, torch.nn.Parameter, str]]
+    ) -> Optional[dict[str, torch.Tensor]]:
+        if len(rescale_refs) == 0:
+            return None
+
+        with torch.no_grad():
+            return {name: param.detach().float().clone() for name, param, _ in rescale_refs}
+
+    def _compute_rescale_update_logs(
+        self,
+        rescale_refs: list[tuple[str, torch.nn.Parameter, str]],
+        before_step: Optional[dict[str, torch.Tensor]],
+    ) -> dict[str, float]:
+        if not rescale_refs or before_step is None:
+            return {}
+
+        def init_stats():
+            return {
+                "numel": 0,
+                "update_abs_sum": 0.0,
+                "update_sq_sum": 0.0,
+                "update_abs_max": 0.0,
+                "value_abs_sum": 0.0,
+                "value_abs_max": 0.0,
+                "value_sum": 0.0,
+            }
+
+        global_stats = init_stats()
+        group_stats = defaultdict(init_stats)
+
+        with torch.no_grad():
+            for name, param, group in rescale_refs:
+                current = param.detach().float()
+                previous = before_step[name]
+                update = current - previous
+                update_abs = update.abs()
+                value_abs = (current - 1.0).abs()
+                numel = current.numel()
+
+                global_stats["numel"] += numel
+                global_stats["update_abs_sum"] += float(update_abs.sum().item())
+                global_stats["update_sq_sum"] += float((update * update).sum().item())
+                global_stats["update_abs_max"] = max(global_stats["update_abs_max"], float(update_abs.max().item()))
+                global_stats["value_abs_sum"] += float(value_abs.sum().item())
+                global_stats["value_abs_max"] = max(global_stats["value_abs_max"], float(value_abs.max().item()))
+                global_stats["value_sum"] += float(current.sum().item())
+
+                stats = group_stats[group]
+                stats["numel"] += numel
+                stats["update_abs_sum"] += float(update_abs.sum().item())
+                stats["update_sq_sum"] += float((update * update).sum().item())
+                stats["update_abs_max"] = max(stats["update_abs_max"], float(update_abs.max().item()))
+                stats["value_abs_sum"] += float(value_abs.sum().item())
+                stats["value_abs_max"] = max(stats["value_abs_max"], float(value_abs.max().item()))
+                stats["value_sum"] += float(current.sum().item())
+
+        def finalize(prefix: str, stats: dict[str, float]) -> dict[str, float]:
+            if stats["numel"] == 0:
+                return {}
+            numel = float(stats["numel"])
+            return {
+                f"{prefix}/update_abs_mean": stats["update_abs_sum"] / numel,
+                f"{prefix}/update_rms": math.sqrt(stats["update_sq_sum"] / numel),
+                f"{prefix}/update_abs_max": stats["update_abs_max"],
+                f"{prefix}/value_mean": stats["value_sum"] / numel,
+                f"{prefix}/value_abs_delta_mean": stats["value_abs_sum"] / numel,
+                f"{prefix}/value_abs_delta_max": stats["value_abs_max"],
+            }
+
+        logs = finalize("rescale/global", global_stats)
+        for group, stats in sorted(group_stats.items()):
+            logs.update(finalize(f"rescale/{group}", stats))
+        return logs
 
     def _prepare_transformer_for_sampling(self, args: argparse.Namespace, transformer: torch.nn.Module) -> dict:
         state = {
@@ -1892,7 +2000,9 @@ class NetworkTrainer:
         # prepare optimizer, data loader etc.
         accelerator.print("prepare optimizer, data loader etc.")
 
-        trainable_params, lr_descriptions = network.prepare_optimizer_params(unet_lr=args.learning_rate)
+        trainable_params, lr_descriptions = network.prepare_optimizer_params(
+            unet_lr=args.learning_rate, optimizer_group_patterns=args.optimizer_group_patterns
+        )
         optimizer_name, optimizer_args, optimizer, optimizer_train_fn, optimizer_eval_fn = self.get_optimizer(
             args, trainable_params
         )
@@ -2207,6 +2317,7 @@ class NetworkTrainer:
         clean_memory_on_device(accelerator.device)
 
         optimizer_train_fn()  # Set training mode
+        rescale_refs = self._collect_rescale_param_refs(accelerator.unwrap_model(network))
 
         for epoch in range(epoch_to_start, num_train_epochs):
             accelerator.print(f"\nepoch {epoch + 1}/{num_train_epochs}")
@@ -2220,6 +2331,7 @@ class NetworkTrainer:
                 # torch.compiler.cudagraph_mark_step_begin() # for cudagraphs
 
                 latents = batch["latents"]
+                rescale_update_logs = {}
 
                 with accelerator.accumulate(training_model):
                     accelerator.unwrap_model(network).on_step_start()
@@ -2265,7 +2377,16 @@ class NetworkTrainer:
                             params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
                             accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
+                    # Snapshot immediately before optimizer.step() so the logged delta reflects the actual
+                    # in-training parameter update. This is especially important for schedule-free
+                    # optimizers, whose eval() mode can swap in different parameter views.
+                    rescale_before_step = None
+                    if accelerator.sync_gradients and len(accelerator.trackers) > 0 and rescale_refs:
+                        rescale_before_step = self._snapshot_rescale_params(rescale_refs)
+
                     optimizer.step()
+                    if accelerator.sync_gradients and rescale_before_step is not None:
+                        rescale_update_logs = self._compute_rescale_update_logs(rescale_refs, rescale_before_step)
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
 
@@ -2321,6 +2442,7 @@ class NetworkTrainer:
                     logs = self.generate_step_logs(
                         args, current_loss, avr_loss, lr_scheduler, lr_descriptions, optimizer, keys_scaled, mean_norm, maximum_norm
                     )
+                    logs.update(rescale_update_logs)
                     accelerator.log(logs, step=global_step)
 
                 if global_step >= args.max_train_steps:
@@ -2621,6 +2743,17 @@ def setup_parser_common() -> argparse.ArgumentParser:
         default=None,
         nargs="*",
         help='additional arguments for optimizer (like "weight_decay=0.01 betas=0.9,0.999 ...") / オプティマイザの追加引数（例： "weight_decay=0.01 betas=0.9,0.999 ..."）',
+    )
+    parser.add_argument(
+        "--optimizer_group_patterns",
+        type=str,
+        default=None,
+        nargs="*",
+        help=(
+            'split trainable params into optimizer param groups by regex over full parameter names, '
+            'for example "name=rescale,pattern=.*\\\\.rescale$". '
+            "Only name and pattern are supported; all groups share the same LR."
+        ),
     )
     parser.add_argument("--learning_rate", type=float, default=2.0e-6, help="learning rate / 学習率")
     parser.add_argument(
