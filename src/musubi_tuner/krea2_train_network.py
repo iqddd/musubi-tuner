@@ -52,6 +52,7 @@ class Krea2NetworkTrainer(NetworkTrainer):
         # so a single snapshot stays valid for the whole run).
         self._turbo_stash = None
         self._raw_stash = None
+        self._h2d_turbo_bank_registered = False
 
     # region model specific
 
@@ -79,18 +80,17 @@ class Krea2NetworkTrainer(NetworkTrainer):
         # Linears, applies on top automatically) and use the Turbo sampling schedule.
         if args.turbo_dit_cache and not args.turbo_dit:
             raise ValueError("--turbo_dit_cache (M1, resident Turbo weights) requires --turbo_dit.")
-        # Turbo sample generation swaps the base weights from outside the model, which is unsafe
-        # under block swap: the offloader (esp. --block_swap_h2d_only's LoRAStreamOffloader) keeps
-        # its own CPU master and streams it to the GPU, so an external weight swap does NOT reach
-        # the weights the forward actually uses -> RAW/Turbo mix (bf16: loss drift; fp8: pure noise
-        # from RAW weight x Turbo scale_weight). Restrict Turbo sampling to the block-swap-disabled
-        # case (it is an optional, VRAM-permitting convenience); with block swap, sample on RAW.
+        # In-place Turbo swapping is compatible with block swap only in cached H2D-only mode.
+        # That offloader has explicit RAW/Turbo CPU master banks and invalidates its GPU ring on
+        # every bank switch. Classic bidirectional block swap has no stable CPU master bank, and
+        # M2 replaces live storages while loading, so those combinations remain unsafe.
         if args.turbo_dit and args.blocks_to_swap:
-            raise ValueError(
-                "--turbo_dit (Turbo sample generation) is not supported together with --blocks_to_swap: "
-                "the block-swap offloader manages the base weights and an external swap would mix RAW/Turbo. "
-                "Use Turbo sampling without block swap (VRAM permitting), or omit --turbo_dit to sample on RAW."
-            )
+            if not args.turbo_dit_cache or not getattr(args, "block_swap_h2d_only", False):
+                raise ValueError(
+                    "--turbo_dit with --blocks_to_swap requires both --turbo_dit_cache and "
+                    "--block_swap_h2d_only. Cached H2D-only mode can switch the offloader's CPU master "
+                    "bank atomically; M2 and classic block swap cannot safely replace the active base weights."
+                )
         if args.turbo_dit and not args.sample_prompts:
             logger.warning("--turbo_dit is set but --sample_prompts is not; Turbo is only used for sample generation.")
 
@@ -257,27 +257,41 @@ class Krea2NetworkTrainer(NetworkTrainer):
             live[k.replace("._orig_mod.", ".")] = t
         return live
 
-    def _snapshot_weights(self, model) -> dict:
+    def _snapshot_weights(self, model, exclude_keys: Optional[set[str]] = None) -> dict:
         """Take an independent CPU snapshot of the model's current base weights (key by key).
 
         Used once to capture RAW before the first Turbo swap-in. Each entry is a fresh CPU
         tensor (``copy=True``), so later in-place writes to the live weights never touch it.
         """
-        return {k: t.detach().to("cpu", copy=True) for k, t in self._named_live_tensors(model).items()}
+        exclude_keys = exclude_keys or set()
+        return {k: t.detach().to("cpu", copy=True) for k, t in self._named_live_tensors(model).items() if k not in exclude_keys}
 
-    def _overwrite_weights(self, model, src: dict):
+    def _overwrite_weights(self, model, src: dict, strict: bool = True):
         """Copy ``src`` into the model's base weights in place (used by BOTH M1 and M2).
 
         Critically this writes through ``copy_`` and never reassigns ``weight.data``: the live
-        tensor keeps its exact storage object and device, so it composes with the block-swap
-        offloader (which itself recycles the ``weight.data`` storages) and with fp8 (where the
-        streamed ``weight`` and the resident ``scale_weight`` must stay consistent). Reassigning
-        ``.data`` instead — the old M1 ping-pong — corrupts that recycling and produced pure
-        noise specifically in the M1 x fp8 x block-swap case. ``copy_`` casts dtype and crosses
-        devices, so block-swapped weights that currently live on CPU stay on CPU.
+        tensor keeps its exact storage object and device. With ``strict=False``, ``src`` may be
+        a partial stash: this is used with the H2D-only offloader, whose streamed Linear weights
+        live in a separate CPU bank while resident tensors and fp8 scale buffers are copied here.
+        ``copy_`` casts dtype and crosses devices as needed. Extra checkpoint keys are ignored,
+        matching the full-stash behavior before bank support was added.
         """
-        for k, t in self._named_live_tensors(model).items():
-            t.data.copy_(src[k])
+        live = self._named_live_tensors(model)
+        if strict:
+            missing = set(live) - set(src)
+            if missing:
+                first = sorted(missing)[0]
+                raise KeyError(f"weight stash is missing {first!r} ({len(missing)} missing keys total)")
+        for k, value in src.items():
+            if k in live:
+                live[k].data.copy_(value)
+
+    @staticmethod
+    def _h2d_bank_offloader(model):
+        """Return the bank-aware H2D-only offloader, if this model uses one."""
+        offloader = getattr(model, "offloader", None)
+        required = ("streamed_weight_keys", "register_weight_bank_from_state_dict", "activate_weight_bank")
+        return offloader if offloader is not None and all(hasattr(offloader, name) for name in required) else None
 
     def _free_base_weights(self, model):
         """Release the live base weight/buffer storages (set ``.data`` to a 0-size tensor).
@@ -317,11 +331,31 @@ class Krea2NetworkTrainer(NetworkTrainer):
                 self._turbo_stash = krea2_utils.load_krea2_dit_state_dict(
                     args.turbo_dit, fp8_scaled=args.fp8_scaled, calc_device=accelerator.device, result_device="cpu"
                 )
-            if self._raw_stash is None:
-                logger.info("Krea 2: snapshotting RAW weights for restore (M1)")
-                self._raw_stash = self._snapshot_weights(model)
-            logger.info("Krea 2: swapping in Turbo weights for sampling (M1)")
-            self._overwrite_weights(model, self._turbo_stash)
+            h2d_offloader = self._h2d_bank_offloader(model)
+            if h2d_offloader is None:
+                if self._raw_stash is None:
+                    logger.info("Krea 2: snapshotting RAW weights for restore (M1)")
+                    self._raw_stash = self._snapshot_weights(model)
+                logger.info("Krea 2: swapping in Turbo weights for sampling (M1)")
+                self._overwrite_weights(model, self._turbo_stash)
+            else:
+                # Streamed Linear weights live in banked CPU masters. Keep them out of the
+                # ordinary stashes: RAW already exists in the offloader, and Turbo is packed
+                # into a second bank. Resident weights, biases and fp8 scale buffers remain
+                # in the partial stashes and are copied in place alongside the bank switch.
+                streamed_keys = h2d_offloader.streamed_weight_keys("blocks")
+                if self._raw_stash is None:
+                    logger.info("Krea 2: snapshotting resident RAW weights for H2D-only restore (M1)")
+                    self._raw_stash = self._snapshot_weights(model, exclude_keys=streamed_keys)
+                if not self._h2d_turbo_bank_registered:
+                    logger.info("Krea 2: packing streamed Turbo weights into the H2D-only CPU bank")
+                    used_keys = h2d_offloader.register_weight_bank_from_state_dict("turbo", self._turbo_stash, "blocks")
+                    for key in used_keys:
+                        del self._turbo_stash[key]
+                    self._h2d_turbo_bank_registered = True
+                logger.info("Krea 2: activating Turbo H2D-only bank for sampling (M1)")
+                h2d_offloader.activate_weight_bank("turbo")
+                self._overwrite_weights(model, self._turbo_stash, strict=False)
         else:
             # M2: free the RAW base weights, then load the Turbo weights (re-quantized if fp8)
             # straight onto the GPU and reassign them. Freeing first keeps the GPU at ~1x the
@@ -345,7 +379,16 @@ class Krea2NetworkTrainer(NetworkTrainer):
         model = accelerator.unwrap_model(transformer)
         if args.turbo_dit_cache:
             logger.info("Krea 2: restoring RAW weights after sampling (M1)")
-            self._overwrite_weights(model, self._raw_stash)  # copy RAW back in place (storage preserved)
+            h2d_offloader = self._h2d_bank_offloader(model)
+            if h2d_offloader is None:
+                self._overwrite_weights(model, self._raw_stash)  # copy RAW back in place (storage preserved)
+            else:
+                h2d_offloader.activate_weight_bank("raw")
+                self._overwrite_weights(model, self._raw_stash, strict=False)
+                # sample_images has already returned the offloader to training mode, but that
+                # prepare happened while Turbo was active. Refill the invalidated ring from RAW
+                # now so the next training forward cannot observe stale Turbo slots.
+                model.prepare_block_swap_before_forward()
         else:
             # M2: free the Turbo base weights, then reload RAW (re-quantized if fp8) straight
             # onto the GPU and reassign — same GPU-direct, CPU-peak-~1-tensor path as swap-in.
@@ -504,8 +547,10 @@ def krea2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
         "--turbo_dit_cache",
         action="store_true",
         help="M1 memory mode for --turbo_dit: keep the (fp8-quantized at startup) Turbo weights resident in "
-        "CPU RAM and ping-pong-swap them in (~1x extra CPU, faster). Default (M2) streams Turbo from disk each "
-        "sample step (re-quantizing if fp8) for ~0x steady CPU at the cost of per-validation load time.",
+        "CPU RAM and ping-pong-swap them in (faster). Without block swap this also keeps a full RAW restore "
+        "snapshot (~2x DiT extra CPU total). With H2D-only block swap, streamed RAW weights reuse the offloader "
+        "master, so the extra CPU cost is one Turbo copy plus only the resident RAW fraction. Default (M2) "
+        "streams Turbo from disk each sample step for ~0x steady CPU at the cost of per-validation load time.",
     )
     return parser
 

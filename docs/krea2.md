@@ -243,9 +243,9 @@ A fox in the snow.  --w 1024 --h 1024 --s 8 --l 1 --d 0
 `--turbo_dit` has two memory modes:
 
 - **Default (streaming)**: the Turbo weights are loaded from disk for each sampling step (re-quantized if fp8) — roughly **no extra steady CPU RAM**, at the cost of per-sample load time.
-- **`--turbo_dit_cache` (resident)**: the Turbo weights are quantized once at startup and kept resident in CPU RAM, swapped in for each sample — **faster**, but uses roughly **1× the DiT size in extra CPU RAM** for the whole run.
+- **`--turbo_dit_cache` (resident)**: the Turbo weights are quantized once at startup and kept resident in CPU RAM, swapped in for each sample — **faster**. Without block swap, the Turbo copy plus the RAW restore snapshot use roughly **2× the DiT size in extra CPU RAM**. With H2D-only block swap, streamed RAW weights reuse the existing offloader master, so the extra cost is one Turbo copy plus only the resident RAW fraction (between roughly 1× and 2×, depending on `blocks_to_swap`).
 
-> **`--turbo_dit` cannot be combined with `--blocks_to_swap`.** Turbo sampling swaps the base weights in place, which is only safe without the block-swap offloader. If you use block swap, omit `--turbo_dit` and sample on the RAW model instead.
+> **Block-swap exception:** `--turbo_dit` can be combined with `--blocks_to_swap` only when both `--turbo_dit_cache` and `--block_swap_h2d_only` are enabled. The H2D-only offloader keeps separate RAW/Turbo CPU master banks and invalidates its GPU ring when switching. Classic block swap and the disk-streaming Turbo mode are not compatible with this weight-bank switch.
 
 <details>
 <summary>日本語</summary>
@@ -259,9 +259,9 @@ A fox in the snow.  --w 1024 --h 1024 --s 8 --l 1 --d 0
 `--turbo_dit`には2つのメモリモードがあります。
 
 - **デフォルト（ストリーミング）**: Turboの重みをサンプリングステップごとにディスクから読み込みます（fp8の場合は再量子化）。**定常のCPU RAM増加はほぼゼロ**ですが、サンプルごとの読み込み時間がかかります。
-- **`--turbo_dit_cache`（常駐）**: Turboの重みを起動時に一度量子化してCPU RAMに常駐させ、サンプルごとにスワップインします。**高速**ですが、実行中ずっと **DiTサイズの約1倍** のCPU RAMを追加で使用します。
+- **`--turbo_dit_cache`（常駐）**: Turboの重みを起動時に一度量子化してCPU RAMに常駐させ、サンプルごとにスワップインするため**高速**です。block swapなしでは、TurboコピーとRAW復元用スナップショットを合わせて **DiTサイズの約2倍** のCPU RAMを追加で使用します。H2D-only block swapでは、streamed RAW weightsは既存のoffloader masterを再利用するため、追加コストはTurbo 1コピーとresident RAW部分だけです（`blocks_to_swap`に応じて概ね1〜2倍）。
 
-> **`--turbo_dit`は`--blocks_to_swap`と併用できません。** Turboサンプリングはベースの重みをその場で入れ替えるため、block swapのオフローダーがない場合にのみ安全です。block swapを使う場合は`--turbo_dit`を省略し、RAWモデルでサンプリングしてください。
+> **block swapの例外:** `--turbo_dit`と`--blocks_to_swap`を併用できるのは、`--turbo_dit_cache`と`--block_swap_h2d_only`も両方有効な場合だけです。H2D-only offloaderはRAW/TurboそれぞれのCPUマスターバンクを保持し、切り替え時にGPUリングを無効化します。通常のblock swapおよびディスクから毎回読み込むTurboモードは、このウェイトバンク切り替えと互換性がありません。
 
 </details>
 

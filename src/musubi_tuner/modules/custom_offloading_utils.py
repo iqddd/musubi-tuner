@@ -815,6 +815,9 @@ class LoRAStreamOffloader:
         self.in_slot = [None] * self.B  # slot -> block_idx currently bound to this slot (or None)
         self.free_event = [None] * self.B  # slot -> cuda.Event recording when compute finished using the slot
         self._module_cache = {}  # block_idx -> [modules with swap weights]
+        self._module_name_cache = {}  # block_idx -> checkpoint-relative module names, same order as _module_cache
+        self._weight_banks = {}  # name -> (cpu_flat, cpu_master); populated with "raw" on first prepare
+        self._active_weight_bank = None
 
         self._wait_ctx = "fwd"  # context tag for wait/load timing ("fwd" while in the forward loop, "bwd" in hooks)
         if self.debug:
@@ -836,20 +839,30 @@ class LoRAStreamOffloader:
 
     # ------------------------------------------------------------------ helpers
 
-    def _swap_modules(self, block: nn.Module) -> list[nn.Module]:
+    def _named_swap_modules(self, block: nn.Module) -> list[tuple[str, nn.Module]]:
         # same selection rule as ModelOffloader.swap_weight_devices_cuda: Linear layers with a weight
         mods = []
-        for _, m in block.named_modules():
+        for name, m in block.named_modules():
             if hasattr(m, "weight") and m.weight is not None and m.__class__.__name__.endswith("Linear"):
-                mods.append(m)
+                mods.append((name, m))
         return mods
+
+    def _swap_modules(self, block: nn.Module) -> list[nn.Module]:
+        return [m for _, m in self._named_swap_modules(block)]
 
     def _modules(self, block_idx: int) -> list[nn.Module]:
         cached = self._module_cache.get(block_idx)
         if cached is None:
-            cached = self._swap_modules(self._blocks[block_idx])
+            named = self._named_swap_modules(self._blocks[block_idx])
+            self._module_name_cache[block_idx] = [name for name, _ in named]
+            cached = [m for _, m in named]
             self._module_cache[block_idx] = cached
         return cached
+
+    def _module_names(self, block_idx: int) -> list[str]:
+        if block_idx not in self._module_name_cache:
+            self._modules(block_idx)
+        return self._module_name_cache[block_idx]
 
     def _bind(self, block_idx: int, params: list[nn.Parameter]):
         for m, p in zip(self._modules(block_idx), params):
@@ -910,6 +923,84 @@ class LoRAStreamOffloader:
         self.copier.sync()
         self.forward_only = forward_only
 
+    @property
+    def active_weight_bank(self) -> Optional[str]:
+        return self._active_weight_bank
+
+    def streamed_weight_keys(self, prefix: str = "blocks") -> set[str]:
+        """Return checkpoint keys owned by the H2D-only CPU master bank.
+
+        Only Linear ``weight`` tensors are streamed. Biases, fp8 ``scale_weight`` buffers,
+        norms, and all weights in resident blocks remain live on the model and must be
+        switched separately by the caller.
+        """
+        keys = set()
+        for block_idx in self.stream_idx:
+            for module_name in self._module_names(block_idx):
+                key = f"{prefix}.{block_idx}.{module_name}.weight"
+                keys.add(key.replace("._orig_mod.", "."))
+        return keys
+
+    def register_weight_bank_from_state_dict(self, name: str, state_dict: dict, prefix: str = "blocks") -> set[str]:
+        """Pack streamed Linear weights from ``state_dict`` into another CPU master bank.
+
+        The initial model weights form the ``raw`` bank during the first prepare. Additional
+        banks reuse exactly the same packed layout and can therefore feed the existing GPU
+        ring without allocating another device copy.
+        """
+        if not self._weight_banks:
+            raise RuntimeError("prepare_block_devices_before_forward must run before registering a weight bank")
+        if name in self._weight_banks:
+            raise ValueError(f"weight bank already exists: {name}")
+
+        cpu_device = torch.device("cpu")
+        bank_flat = {}
+        bank_master = {}
+        used_keys = set()
+        for block_idx in self.stream_idx:
+            template = [p.data for p in self.cpu_master[block_idx]]
+            flat = torch.empty(self._layout[1], dtype=torch.uint8, device=cpu_device)
+            if self.use_pinned_memory:
+                flat = flat.pin_memory(device=self.device)
+            views = self._flat_views(flat, template)
+            params = []
+            for module_name, view in zip(self._module_names(block_idx), views):
+                key = f"{prefix}.{block_idx}.{module_name}.weight".replace("._orig_mod.", ".")
+                if key not in state_dict:
+                    raise KeyError(f"weight bank {name!r} is missing {key!r}")
+                source = state_dict[key]
+                if source.shape != view.shape:
+                    raise ValueError(
+                        f"weight bank {name!r} has incompatible shape for {key}: {tuple(source.shape)} != {tuple(view.shape)}"
+                    )
+                view.copy_(source.detach().to(device=cpu_device, dtype=view.dtype))
+                params.append(nn.Parameter(view, requires_grad=False))
+                used_keys.add(key)
+            bank_flat[block_idx] = flat
+            bank_master[block_idx] = params
+
+        self._weight_banks[name] = (bank_flat, bank_master)
+        return used_keys
+
+    def activate_weight_bank(self, name: str):
+        """Atomically select a CPU master bank and invalidate stale GPU ring contents."""
+        if name not in self._weight_banks:
+            raise KeyError(f"unknown weight bank: {name}")
+        if name == self._active_weight_bank:
+            return
+
+        # A ring slot may still be used by compute or filled on the private copy stream.
+        # Finish both before rebinding module Parameters and reusing the slots.
+        self.copier.sync()
+        _synchronize_device(self.device)
+        self.cpu_flat, self.cpu_master = self._weight_banks[name]
+        for block_idx in self.stream_idx:
+            self._bind(block_idx, self.cpu_master[block_idx])
+        self.in_slot = [None] * self.B
+        self.free_event = [None] * self.B
+        self.copier.reset()
+        self._active_weight_bank = name
+
     def __del__(self):
         if getattr(self, "supports_backward", False):
             for handle in getattr(self, "remove_handles", []):
@@ -964,6 +1055,10 @@ class LoRAStreamOffloader:
                 assert p.data.shape == t.data.shape and p.data.dtype == t.data.dtype, (
                     f"block {b} swap-weight shape/dtype differs from the streaming template"
                 )
+
+        if first_time:
+            self._weight_banks["raw"] = (self.cpu_flat, self.cpu_master)
+            self._active_weight_bank = "raw"
 
         # preallocate the GPU ring (once); copies happen into these flat buffers, never reallocated
         if self.ring_param is None:
