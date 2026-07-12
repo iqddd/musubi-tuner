@@ -2,6 +2,7 @@ import numpy as np
 import torch
 
 from musubi_tuner.cache_latents import set_alpha_mask_for_image_item
+from musubi_tuner.dataset.cache_io import add_alpha_mask_to_latent_cache
 from musubi_tuner.dataset.image_video_dataset import ItemInfo
 from musubi_tuner.utils.train_utils import apply_alpha_masked_loss
 
@@ -55,3 +56,23 @@ def test_apply_alpha_masked_loss_for_layered_loss():
 
     expected = alpha_mask.unsqueeze(2).expand_as(loss)
     torch.testing.assert_close(masked_loss, expected)
+
+
+def test_alpha_mask_is_added_to_cache_payload():
+    item = ItemInfo("sample.png", "", (2, 2))
+    item.alpha_mask = torch.tensor([[1.0, 0.5], [0.0, 1.0]])
+    payload = {"latents_1x2x2_float32": torch.zeros((1, 2, 2))}
+
+    add_alpha_mask_to_latent_cache(item, payload)
+
+    torch.testing.assert_close(payload["alpha_mask"], item.alpha_mask)
+    assert payload["alpha_mask"].dtype == torch.float32
+
+
+def test_apply_alpha_masked_loss_ignores_non_spatial_loss():
+    loss = torch.ones((1, 4, 8))
+    alpha_mask = torch.zeros((1, 2, 2))
+
+    masked_loss = apply_alpha_masked_loss(loss, {"alpha_mask": alpha_mask})
+
+    assert masked_loss is loss

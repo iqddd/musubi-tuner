@@ -1355,7 +1355,11 @@ class NetworkTrainer:
         The transformer is still wrapped by the accelerator at this point. Use this hook for
         pre-inference setup such as switching auxiliary modules to eval mode or stashing training state.
         """
-        pass
+        sampling_network = accelerator.unwrap_model(network)
+        self._sampling_network = sampling_network if hasattr(sampling_network, "prepare_for_sampling") else None
+        self._sampling_network_state = (
+            self._sampling_network.prepare_for_sampling() if self._sampling_network is not None else None
+        )
 
     def on_after_sample_images(
         self, accelerator, args, epoch, steps, vae, transformer, network, sample_parameters, dit_dtype
@@ -1366,7 +1370,11 @@ class NetworkTrainer:
         post-inference cleanup such as restoring auxiliary modules to train mode or updating state
         based on the generated samples.
         """
-        pass
+        sampling_network = getattr(self, "_sampling_network", None)
+        if sampling_network is not None and hasattr(sampling_network, "finish_sampling"):
+            sampling_network.finish_sampling(getattr(self, "_sampling_network_state", None))
+        self._sampling_network = None
+        self._sampling_network_state = None
 
     def extra_trainable_params(
         self,
