@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from typing import Optional, TYPE_CHECKING, Union
 
@@ -403,23 +404,52 @@ def save_text_encoder_output_cache_qwen_image(item_info: ItemInfo, embed: torch.
     save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_QWEN_IMAGE_FULL)
 
 
-def save_text_encoder_output_cache_krea2(item_info: ItemInfo, embed: torch.Tensor):
+def save_text_encoder_output_cache_krea2(
+    item_info: ItemInfo, embeds: list[torch.Tensor], captions: list[str], multi_caption: bool = True
+):
     """Krea 2 (K2) architecture.
 
-    `embed` is the per-item stack of *selected* Qwen3-VL hidden-state layers for the
-    valid (non-padding) tokens only: shape (valid_len, num_select_layers, hidden).
-    Stored varlen (no padding, no mask): K2 gives text tokens zero RoPE position and
-    masks padding in attention, so dropping padding is lossless for the image outputs.
-    The layerwise fusion (TextFusionTransformer) is trainable and lives in the DiT, so
-    the raw selected-layer stack is what gets cached.
+    Each entry in ``embeds`` corresponds to the caption at the same index in
+    ``captions``. Every tensor is the per-item stack of *selected* Qwen3-VL
+    hidden-state layers for valid (non-padding) tokens only, with shape
+    ``(valid_len, num_selected_layers, hidden)``. The numbered keys are selected
+    deterministically during training; they are not stacked because token lengths
+    differ between caption alternatives.
     """
-    assert embed.dim() == 3, "embed should be 3D tensor (valid_len, num_select_layers, hidden)"
+    if not embeds or len(embeds) != len(captions):
+        raise ValueError("Krea 2 cache requires one non-empty embedding list matching the caption variants")
+    if any(embed.dim() != 3 for embed in embeds):
+        raise ValueError("Krea 2 embeddings must be 3D tensors (valid_len, num_select_layers, hidden)")
 
-    sd = {}
-    dtype_str = dtype_to_str(embed.dtype)
-    sd[f"varlen_krea2_vl_embed_{dtype_str}"] = embed.detach().cpu()
+    if not multi_caption:
+        if len(embeds) != 1:
+            raise ValueError("Krea 2 single-caption cache requires exactly one embedding")
+        embed = embeds[0]
+        save_text_encoder_output_cache_common(
+            item_info,
+            {f"varlen_krea2_vl_embed_{dtype_to_str(embed.dtype)}": embed.detach().cpu()},
+            ARCHITECTURE_KREA2_FULL,
+            merge_existing=False,
+        )
+        return
 
-    save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_KREA2_FULL)
+    sd = {
+        f"varlen_krea2_vl_embed_caption_{index:04d}_{dtype_to_str(embed.dtype)}": embed.detach().cpu()
+        for index, embed in enumerate(embeds)
+    }
+
+    save_text_encoder_output_cache_common(
+        item_info,
+        sd,
+        ARCHITECTURE_KREA2_FULL,
+        merge_existing=False,
+        extra_metadata={
+            "caption1": captions[0],
+            "captions": json.dumps(captions, ensure_ascii=False),
+            "caption_count": str(len(captions)),
+            "format_version": "1.1.0",
+        },
+    )
 
 
 def save_text_encoder_output_cache_kandinsky5(
@@ -495,6 +525,7 @@ def save_text_encoder_output_cache_common(
     sd: dict[str, torch.Tensor],
     arch_fullname: str,
     merge_existing: bool = True,
+    extra_metadata: Optional[dict[str, str]] = None,
 ):
     # merge_existing keeps keys written by previous passes (e.g. HunyuanVideo caches LLM and CLIP separately).
     # Single-pass architectures that write their full key set at once should pass merge_existing=False so the
@@ -510,6 +541,8 @@ def save_text_encoder_output_cache_common(
         "caption1": item_info.caption,
         "format_version": "1.0.1",
     }
+    if extra_metadata is not None:
+        metadata.update(extra_metadata)
     if merge_existing and os.path.exists(item_info.text_encoder_output_cache_path):
         # load existing cache and update metadata
         new_key_bases = {remove_dtype_suffix(key) for key in sd}  # logical keys (dtype stripped) just written

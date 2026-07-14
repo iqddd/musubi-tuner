@@ -60,6 +60,9 @@ class ItemInfo:
         self.content = content
         self.latent_cache_path = latent_cache_path
         self.text_encoder_output_cache_path: Optional[str] = None
+        # Used only while Krea 2 caches multi-caption text encoder outputs.
+        # Training reads variants from the TE cache, not from ItemInfo.
+        self.caption_variants: Optional[list[str]] = None
 
         # np.ndarray for video, list[np.ndarray] for image with multiple controls
         self.control_content: Optional[Union[np.ndarray, list[np.ndarray]]] = None
@@ -174,7 +177,7 @@ class BaseDataset(torch.utils.data.Dataset):
     def retrieve_latent_cache_batches(self, num_workers: int):
         raise NotImplementedError
 
-    def retrieve_text_encoder_output_cache_batches(self, num_workers: int):
+    def retrieve_text_encoder_output_cache_batches(self, num_workers: int, multi_caption: bool = False):
         raise NotImplementedError
 
     def prepare_for_training(self, num_timestep_buckets: Optional[int] = None):
@@ -210,8 +213,14 @@ class BaseDataset(torch.utils.data.Dataset):
             logger.warning(f"epoch is not incremented. current_epoch: {self.current_epoch}, epoch: {epoch}")
             self.current_epoch = epoch
 
-    def _default_retrieve_text_encoder_output_cache_batches(self, datasource: ContentDatasource, batch_size: int, num_workers: int):
+        if self.batch_manager is not None:
+            self.batch_manager.set_current_epoch(self.current_epoch)
+
+    def _default_retrieve_text_encoder_output_cache_batches(
+        self, datasource: ContentDatasource, batch_size: int, num_workers: int, multi_caption: bool = False
+    ):
         datasource.set_caption_only(True)
+        datasource.set_caption_variants_only(multi_caption)
         executor = ThreadPoolExecutor(max_workers=num_workers)
 
         data: list[ItemInfo] = []
@@ -228,8 +237,16 @@ class BaseDataset(torch.utils.data.Dataset):
                         break  # submit batch if possible
 
                 for future in completed_futures:
-                    item_key, caption = future.result()
+                    item_key, caption_or_variants = future.result()
+                    if multi_caption:
+                        caption_variants = caption_or_variants
+                        assert isinstance(caption_variants, list) and len(caption_variants) > 0
+                        caption = caption_variants[0]
+                    else:
+                        caption = caption_or_variants
                     item_info = ItemInfo(item_key, caption, (0, 0), (0, 0))
+                    if multi_caption:
+                        item_info.caption_variants = caption_variants
                     item_info.text_encoder_output_cache_path = self.get_text_encoder_output_cache_path(item_info)
                     data.append(item_info)
 
@@ -499,8 +516,13 @@ class ImageDataset(BaseDataset):
 
         executor.shutdown()
 
-    def retrieve_text_encoder_output_cache_batches(self, num_workers: int):
-        return self._default_retrieve_text_encoder_output_cache_batches(self.datasource, self.batch_size, num_workers)
+    def retrieve_text_encoder_output_cache_batches(self, num_workers: int, multi_caption: bool = False):
+        return self._default_retrieve_text_encoder_output_cache_batches(
+            self.datasource,
+            self.batch_size,
+            num_workers,
+            multi_caption=multi_caption and self.architecture == ARCHITECTURE_KREA2,
+        )
 
     def prepare_for_training(self, num_timestep_buckets: Optional[int] = None):
         bucket_selector = BucketSelector(self.resolution, self.enable_bucket, self.bucket_no_upscale, self.architecture)
@@ -556,7 +578,12 @@ class ImageDataset(BaseDataset):
             bucketed_item_info[bucket_reso] = bucket
 
         # prepare batch manager
-        self.batch_manager = BucketBatchManager(bucketed_item_info, self.batch_size, num_timestep_buckets=num_timestep_buckets)
+        self.batch_manager = BucketBatchManager(
+            bucketed_item_info,
+            self.batch_size,
+            num_timestep_buckets=num_timestep_buckets,
+            caption_selection_seed=self.seed,
+        )
         self.batch_manager.show_bucket_info()
 
         self.num_train_items = sum([len(bucket) for bucket in bucketed_item_info.values()])
@@ -852,7 +879,7 @@ class VideoDataset(BaseDataset):
 
         executor.shutdown()
 
-    def retrieve_text_encoder_output_cache_batches(self, num_workers: int):
+    def retrieve_text_encoder_output_cache_batches(self, num_workers: int, multi_caption: bool = False):
         return self._default_retrieve_text_encoder_output_cache_batches(self.datasource, self.batch_size, num_workers)
 
     def prepare_for_training(self, num_timestep_buckets: Optional[int] = None):
@@ -890,7 +917,12 @@ class VideoDataset(BaseDataset):
             bucketed_item_info[bucket_reso] = bucket
 
         # prepare batch manager
-        self.batch_manager = BucketBatchManager(bucketed_item_info, self.batch_size, num_timestep_buckets=num_timestep_buckets)
+        self.batch_manager = BucketBatchManager(
+            bucketed_item_info,
+            self.batch_size,
+            num_timestep_buckets=num_timestep_buckets,
+            caption_selection_seed=self.seed,
+        )
         self.batch_manager.show_bucket_info()
 
         self.num_train_items = sum([len(bucket) for bucket in bucketed_item_info.values()])

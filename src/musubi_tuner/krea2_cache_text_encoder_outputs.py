@@ -9,15 +9,19 @@ the image outputs.
 """
 
 import argparse
+import json
 import logging
+import os
 
 import torch
 
 from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
 from musubi_tuner.dataset.image_video_dataset import ItemInfo, save_text_encoder_output_cache_krea2
-from musubi_tuner.dataset.architectures import ARCHITECTURE_KREA2
+from musubi_tuner.dataset.architectures import ARCHITECTURE_KREA2, ARCHITECTURE_KREA2_FULL
 from musubi_tuner.krea2 import krea2_utils
+from musubi_tuner.utils import safetensors_utils
+from musubi_tuner.utils.model_utils import remove_dtype_suffix
 
 import musubi_tuner.cache_text_encoder_outputs as cache_text_encoder_outputs
 
@@ -25,18 +29,69 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
-def encode_and_save_batch(encoder, batch: list[ItemInfo]):
-    prompts = [item.caption for item in batch]
+KREA2_MULTI_CAPTION_KEY_PREFIX = "varlen_krea2_vl_embed_caption_"
+
+
+def caption_variants(item: ItemInfo) -> list[str]:
+    return item.caption_variants if item.caption_variants is not None else [item.caption]
+
+
+def encode_and_save_batch(encoder, batch: list[ItemInfo], prompt_batch_size: int | None, multi_caption: bool = False):
+    flattened_prompts: list[tuple[int, str]] = []
+    variants_by_item: list[list[str]] = []
     for i, item in enumerate(batch):
-        print(f"Item {i}: {item.item_key}, prompt: {item.caption}")
+        variants = caption_variants(item) if multi_caption else [item.caption]
+        variants_by_item.append(variants)
+        print(f"Item {i}: {item.item_key}, prompts: {variants}")
+        flattened_prompts.extend((i, prompt) for prompt in variants)
 
-    hiddens, mask = krea2_utils.get_krea2_prompt_embeds(encoder, prompts)  # (B, seq, L, D), (B, seq)
+    embeds_by_item: list[list[torch.Tensor]] = [[] for _ in batch]
+    prompt_batch_size = prompt_batch_size or len(flattened_prompts)
+    for start in range(0, len(flattened_prompts), prompt_batch_size):
+        prompt_batch = flattened_prompts[start : start + prompt_batch_size]
+        hiddens, mask = krea2_utils.get_krea2_prompt_embeds(encoder, [prompt for _, prompt in prompt_batch])
 
-    # Save per item, dropping padding tokens (varlen).
-    for item, hidden_i, mask_i in zip(batch, hiddens, mask):
-        valid = mask_i.bool()
-        embed_i = hidden_i[valid]  # (valid_len, L, D)
-        save_text_encoder_output_cache_krea2(item, embed_i)
+        for (item_index, _), hidden_i, mask_i in zip(prompt_batch, hiddens, mask):
+            valid = mask_i.bool()
+            embeds_by_item[item_index].append(hidden_i[valid])  # (valid_len, L, D)
+
+    for item, embeds, variants in zip(batch, embeds_by_item, variants_by_item):
+        save_text_encoder_output_cache_krea2(item, embeds, variants, multi_caption=multi_caption)
+
+
+def is_krea2_text_encoder_cache_current(item: ItemInfo) -> bool:
+    """Validate Krea's caption list and tensor set for --skip_existing."""
+    cache_path = item.text_encoder_output_cache_path
+    if cache_path is None or not os.path.exists(cache_path):
+        return False
+
+    expected_captions = caption_variants(item)
+    try:
+        with safetensors_utils.MemoryEfficientSafeOpen(cache_path) as cache_file:
+            metadata = cache_file.metadata()
+            if metadata.get("architecture") != ARCHITECTURE_KREA2_FULL:
+                return False
+
+            cached_captions_json = metadata.get("captions")
+            if cached_captions_json is None:
+                # Legacy one-caption cache remains usable without re-caching.
+                if len(expected_captions) != 1 or metadata.get("caption1") != expected_captions[0]:
+                    return False
+                return any(remove_dtype_suffix(key) == "varlen_krea2_vl_embed" for key in cache_file.keys())
+
+            if json.loads(cached_captions_json) != expected_captions:
+                return False
+
+            expected_bases = {f"{KREA2_MULTI_CAPTION_KEY_PREFIX}{index:04d}" for index in range(len(expected_captions))}
+            cached_bases = {
+                remove_dtype_suffix(key)
+                for key in cache_file.keys()
+                if remove_dtype_suffix(key).startswith(KREA2_MULTI_CAPTION_KEY_PREFIX)
+            }
+            return cached_bases == expected_bases and metadata.get("caption_count") == str(len(expected_captions))
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        logger.warning(f"Krea 2 TE cache is unreadable or invalid and will be rebuilt: {cache_path} ({exc})")
+        return False
 
 
 def krea2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -47,6 +102,11 @@ def krea2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
         help="Qwen3-VL-4B text encoder safetensors path (official or ComfyUI key layout)",
     )
     parser.add_argument("--text_encoder_dtype", type=str, default=None, help="data type for the text encoder, default is bfloat16")
+    parser.add_argument(
+        "--multi_caption",
+        action="store_true",
+        help="treat each non-empty line in directory caption files as a separate Krea 2 caption alternative",
+    )
     return parser
 
 
@@ -82,7 +142,7 @@ def main():
 
     def encode_for_text_encoder(batch: list[ItemInfo]):
         nonlocal encoder
-        encode_and_save_batch(encoder, batch)
+        encode_and_save_batch(encoder, batch, args.batch_size, multi_caption=args.multi_caption)
 
     cache_text_encoder_outputs.process_text_encoder_batches(
         args.num_workers,
@@ -92,6 +152,8 @@ def main():
         all_cache_files_for_dataset,
         all_cache_paths_for_dataset,
         encode_for_text_encoder,
+        is_cache_valid=is_krea2_text_encoder_cache_current,
+        multi_caption=args.multi_caption,
     )
     del encoder
 

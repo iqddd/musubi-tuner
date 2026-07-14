@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import math
 import random
 from typing import Any, Optional, Tuple, TYPE_CHECKING
@@ -35,6 +36,9 @@ if TYPE_CHECKING:
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+KREA2_MULTI_CAPTION_KEY_PREFIX = "varlen_krea2_vl_embed_caption_"
 
 
 class BucketSelector:
@@ -167,7 +171,11 @@ class BucketSelector:
 
 class BucketBatchManager:
     def __init__(
-        self, bucketed_item_info: dict[tuple[Any], list[ItemInfo]], batch_size: int, num_timestep_buckets: Optional[int] = None
+        self,
+        bucketed_item_info: dict[tuple[Any], list[ItemInfo]],
+        batch_size: int,
+        num_timestep_buckets: Optional[int] = None,
+        caption_selection_seed: Optional[int] = None,
     ):
         self.batch_size = batch_size
         self.buckets = bucketed_item_info
@@ -175,6 +183,8 @@ class BucketBatchManager:
         self.bucket_resos.sort()
         self.num_timestep_buckets = num_timestep_buckets
         self.timestep_pool = None
+        self.caption_selection_seed = caption_selection_seed
+        self.current_epoch = 0
 
         # indices for enumerating batches. each batch is reso + batch_idx. reso is (width, height) or (width, height, frames)
         self.bucket_batch_indices: list[tuple[tuple[Any], int]] = []
@@ -233,6 +243,55 @@ class BucketBatchManager:
                 self.timestep_pool.append(all_timesteps[start_idx:end_idx])
                 # print(f"timestep pool {i}: {self.timestep_pool[-1]}")
 
+    def set_current_epoch(self, epoch: int):
+        self.current_epoch = epoch
+
+    @staticmethod
+    def _select_krea2_caption_index(
+        candidate_count: int, seed: int, epoch: int, dataset_index: int, item_offset: int, item_key: str
+    ) -> int:
+        """Choose a Krea 2 caption without relying on process-local RNG state."""
+        if candidate_count < 1:
+            raise ValueError("Krea 2 multi-caption cache contains no caption embeddings")
+        payload = f"{seed}\0{epoch}\0{dataset_index}\0{item_offset}\0{item_key}".encode("utf-8")
+        value = int.from_bytes(hashlib.blake2b(payload, digest_size=8).digest(), byteorder="little")
+        return value % candidate_count
+
+    def _select_krea2_caption_embed(
+        self, sd_te: dict[str, torch.Tensor], item_info: ItemInfo, dataset_index: int, item_offset: int
+    ) -> None:
+        """Replace numbered Krea alternatives with the legacy canonical key in-place."""
+        candidates: dict[int, str] = {}
+        for key in list(sd_te):
+            key_base = remove_dtype_suffix(key)
+            if not key_base.startswith(KREA2_MULTI_CAPTION_KEY_PREFIX):
+                continue
+            index_text = key_base.removeprefix(KREA2_MULTI_CAPTION_KEY_PREFIX)
+            if not index_text.isdigit():
+                raise ValueError(f"Invalid Krea 2 multi-caption cache key {key!r}: {item_info.text_encoder_output_cache_path}")
+            index = int(index_text)
+            if index in candidates:
+                raise ValueError(f"Duplicate Krea 2 multi-caption index {index}: {item_info.text_encoder_output_cache_path}")
+            candidates[index] = key
+
+        if not candidates:
+            return  # Legacy one-caption cache: its canonical key is already present.
+
+        expected_indices = list(range(len(candidates)))
+        if sorted(candidates) != expected_indices:
+            raise ValueError(f"Non-contiguous Krea 2 multi-caption indices: {item_info.text_encoder_output_cache_path}")
+        if self.caption_selection_seed is None:
+            raise RuntimeError("Krea 2 multi-caption selection seed is not initialized")
+
+        selected_index = self._select_krea2_caption_index(
+            len(candidates), self.caption_selection_seed, self.current_epoch, dataset_index, item_offset, item_info.item_key
+        )
+        selected_key = candidates[selected_index]
+        selected_embed = sd_te[selected_key]
+        for key in candidates.values():
+            del sd_te[key]
+        sd_te["varlen_krea2_vl_embed"] = selected_embed
+
     def __len__(self):
         return len(self.bucket_batch_indices)
 
@@ -244,9 +303,10 @@ class BucketBatchManager:
 
         batch_tensor_data = {}
         varlen_keys = set()
-        for item_info in bucket[start:end]:
+        for item_offset, item_info in enumerate(bucket[start:end]):
             sd_latent = load_file(item_info.latent_cache_path)
             sd_te = load_file(item_info.text_encoder_output_cache_path)
+            self._select_krea2_caption_embed(sd_te, item_info, idx, item_offset)
             sd = {**sd_latent, **sd_te}
 
             # TODO refactor this

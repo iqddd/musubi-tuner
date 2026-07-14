@@ -100,6 +100,7 @@ python src/musubi_tuner/krea2_cache_text_encoder_outputs.py \
 - Uses `krea2_cache_text_encoder_outputs.py`.
 - Requires the `--text_encoder` (Qwen3-VL-4B-Instruct) argument.
 - Larger batch sizes require more VRAM. Adjust `--batch_size` according to your VRAM capacity.
+- Pass `--multi_caption` to treat every non-empty line in directory caption files (CR, LF, or CRLF) as a separate alternative. During training one alternative is chosen deterministically from `--seed`, the epoch, and the sample position. Without this flag, the whole file remains one caption, including line breaks. JSONL captions remain single prompts. Re-run this cache step after editing caption files; `--skip_existing` validates the stored alternatives.
 
 <details>
 <summary>日本語</summary>
@@ -109,6 +110,7 @@ python src/musubi_tuner/krea2_cache_text_encoder_outputs.py \
 - `krea2_cache_text_encoder_outputs.py`を使用します。
 - `--text_encoder`（Qwen3-VL-4B-Instruct）引数が必要です。
 - バッチサイズが大きいほど、より多くのVRAMが必要です。VRAM容量に応じて`--batch_size`を調整してください。
+- `--multi_caption`を指定すると、ディレクトリのcaptionファイルの空でない各行（CR、LF、CRLF）が別々の候補としてエンコード・保存されます。学習時には`--seed`、エポック、サンプル位置から決定的に1つ選ばれます。このフラグなしでは、改行を含むファイル全体が1つのcaptionのままです。JSONLのcaptionは単一プロンプトのままです。captionファイルを変更した後はこのキャッシュ手順を再実行してください。`--skip_existing`は保存済み候補を検証します。
 
 </details>
 

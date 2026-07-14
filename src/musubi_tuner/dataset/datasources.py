@@ -16,13 +16,33 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def split_caption_file_variants(caption: str, caption_path: str) -> list[str]:
+    """Return the non-empty caption lines in a directory caption file.
+
+    ``str.splitlines`` deliberately accepts CR, LF, and CRLF.  This is only
+    used by Krea 2's text-encoder cache path; regular caption reads still
+    return the complete file unchanged for every other architecture.
+    """
+    variants = [line.strip() for line in caption.splitlines() if line.strip()]
+    if not variants:
+        raise ValueError(f"Caption file has no non-empty caption variants: {caption_path}")
+    return variants
+
+
 class ContentDatasource:
     def __init__(self):
         self.caption_only = False  # set to True to only fetch caption for Text Encoder caching
+        self.caption_variants_only = False  # set for Krea 2 multi-caption Text Encoder caching
         self.has_control = False
 
     def set_caption_only(self, caption_only: bool):
         self.caption_only = caption_only
+        if not caption_only:
+            self.caption_variants_only = False
+
+    def set_caption_variants_only(self, caption_variants_only: bool):
+        self.caption_variants_only = caption_variants_only
+
 
     def is_indexable(self):
         return False
@@ -32,6 +52,15 @@ class ContentDatasource:
         Returns caption. May not be called if is_indexable() returns False.
         """
         raise NotImplementedError
+
+    def get_caption_variants(self, idx: int) -> tuple[str, list[str]]:
+        """Return caption alternatives for TE caching.
+
+        Datasources other than directory caption files intentionally retain a
+        single caption. This keeps JSONL and all non-Krea callers unchanged.
+        """
+        item_key, caption = self.get_caption(idx)
+        return item_key, [caption]
 
     def __len__(self):
         raise NotImplementedError
@@ -245,6 +274,12 @@ class ImageDirectoryDatasource(ImageDatasource):
             caption = f.read().strip()
         return image_path, caption
 
+    def get_caption_variants(self, idx: int) -> tuple[str, list[str]]:
+        image_path = self.image_paths[idx]
+        caption_path = os.path.splitext(image_path)[0] + self.caption_extension if self.caption_extension else ""
+        with open(caption_path, "r", encoding="utf-8") as f:
+            return image_path, split_caption_file_variants(f.read(), caption_path)
+
     def __iter__(self):
         self.current_idx = 0
         return self
@@ -259,7 +294,7 @@ class ImageDirectoryDatasource(ImageDatasource):
         if self.caption_only:
 
             def create_caption_fetcher(index):
-                return lambda: self.get_caption(index)
+                return lambda: self.get_caption_variants(index) if self.caption_variants_only else self.get_caption(index)
 
             fetcher = create_caption_fetcher(self.current_idx)
         else:
@@ -386,7 +421,7 @@ class ImageJsonlDatasource(ImageDatasource):
         if self.caption_only:
 
             def create_caption_fetcher(index):
-                return lambda: self.get_caption(index)
+                return lambda: self.get_caption_variants(index) if self.caption_variants_only else self.get_caption(index)
 
             fetcher = create_caption_fetcher(self.current_idx)
 
