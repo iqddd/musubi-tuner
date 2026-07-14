@@ -24,6 +24,7 @@ from musubi_tuner.networks.boft import (
     merge_weights_to_tensor,
     packed_oft_blocks_to_export,
 )
+from musubi_tuner.inspect_boft import summarize_boft_file
 
 
 def import_detect_network_type():
@@ -230,6 +231,20 @@ class TestBOFT(unittest.TestCase):
         self.assertEqual(packed_blocks.ndim, 3)
         self.assertTrue(torch.allclose(full_blocks, export_blocks))
         self.assertTrue(torch.allclose(packed_blocks, export_oft_blocks_to_packed(export_blocks)))
+
+    def test_inspector_summarizes_torch_checkpoint(self):
+        state_dict = {
+            "lora_unet_single_blocks_0_linear1.oft_blocks": torch.zeros(2, 4, 6),
+            "lora_unet_single_blocks_0_linear1.rescale": torch.ones(8),
+            "lora_unet_single_blocks_0_linear1.alpha": torch.tensor(0.2),
+        }
+        with NamedTemporaryFile(suffix=".pt") as tmp:
+            torch.save(state_dict, tmp.name)
+            report = summarize_boft_file(tmp.name, "none")
+
+        self.assertEqual(report["module_count"], 1)
+        self.assertEqual(report["top_modules"][0]["representation"], "packed")
+        self.assertAlmostEqual(report["saved_alpha_values"][0], 0.2)
 
 
 if __name__ == "__main__":

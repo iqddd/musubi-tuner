@@ -20,6 +20,43 @@ logging.basicConfig(level=logging.INFO)
 HUNYUAN_TARGET_REPLACE_MODULES = ["MMDoubleStreamBlock", "MMSingleStreamBlock"]
 
 
+def parse_optimizer_group_patterns(group_specs: Optional[List[str]]) -> List[Dict[str, Any]]:
+    if not group_specs:
+        return []
+
+    compiled_groups = []
+    for spec in group_specs:
+        config = {}
+        for item in spec.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if "=" not in item:
+                raise ValueError(
+                    f"Invalid optimizer_group_patterns entry {spec!r}. Expected comma-separated key=value pairs."
+                )
+            key, value = item.split("=", 1)
+            config[key.strip()] = value.strip()
+
+        unknown_keys = set(config.keys()) - {"name", "pattern"}
+        if unknown_keys:
+            raise ValueError(
+                f"Unsupported optimizer_group_patterns keys {sorted(unknown_keys)} in {spec!r}. "
+                "Only 'name' and 'pattern' are supported."
+            )
+        if "name" not in config or "pattern" not in config:
+            raise ValueError(f"optimizer_group_patterns entry {spec!r} must include both name=... and pattern=...")
+
+        try:
+            pattern = re.compile(config["pattern"])
+        except re.error as e:
+            raise ValueError(f"Invalid optimizer_group_patterns regex {config['pattern']!r}: {e}") from e
+
+        compiled_groups.append({"name": config["name"], "pattern": pattern})
+
+    return compiled_groups
+
+
 class LoRAModule(torch.nn.Module):
     """
     replaces forward method of the original Linear, instead of replacing the original Linear module.
@@ -45,7 +82,7 @@ class LoRAModule(torch.nn.Module):
         super().__init__()
         self.lora_name = lora_name
 
-        if org_module.__class__.__name__ == "Conv2d":
+        if org_module.__class__.__name__ in ("Conv2d", "Conv3d"):
             in_dim = org_module.in_channels
             out_dim = org_module.out_channels
         else:
@@ -62,6 +99,12 @@ class LoRAModule(torch.nn.Module):
                 padding = org_module.padding
                 self.lora_down = torch.nn.Conv2d(in_dim, self.lora_dim, kernel_size, stride, padding, bias=False)
                 self.lora_up = torch.nn.Conv2d(self.lora_dim, out_dim, (1, 1), (1, 1), bias=False)
+            elif org_module.__class__.__name__ == "Conv3d":
+                kernel_size = org_module.kernel_size
+                stride = org_module.stride
+                padding = org_module.padding
+                self.lora_down = torch.nn.Conv3d(in_dim, self.lora_dim, kernel_size, stride, padding, bias=False)
+                self.lora_up = torch.nn.Conv3d(self.lora_dim, out_dim, (1, 1, 1), (1, 1, 1), bias=False)
             else:
                 self.lora_down = torch.nn.Linear(in_dim, self.lora_dim, bias=False)
                 self.lora_up = torch.nn.Linear(self.lora_dim, out_dim, bias=False)
@@ -95,6 +138,35 @@ class LoRAModule(torch.nn.Module):
         self.rank_dropout = rank_dropout
         self.module_dropout = module_dropout
 
+    def _autocast_enabled_for(self, x):
+        if not x.is_floating_point():
+            return False
+        try:
+            return torch.is_autocast_enabled(x.device.type)
+        except TypeError:
+            return torch.is_autocast_enabled()
+
+    def _lora_input(self, x):
+        if self.split_dims is None:
+            target_dtype = self.lora_down.weight.dtype
+        else:
+            target_dtype = self.lora_down[0].weight.dtype
+        if x.is_floating_point() and x.dtype != target_dtype and not self._autocast_enabled_for(x):
+            return x.to(target_dtype)
+        return x
+
+    def _match_org_dtype(self, value, org_forwarded):
+        """Round ``value`` to the base output dtype.
+
+        Used to bring the LoRA-augmented output back to ``org_forwarded``'s dtype in the
+        autocast-free mixed-dtype regime (e.g. fp32 LoRA on a bf16 base). Callers pass the
+        full ``org_forwarded + delta`` sum here so the (possibly higher-precision) delta is
+        kept through the addition and the result is rounded only once. A no-op when dtypes
+        already match (autocast-on / all-fp32 regimes)."""
+        if value.is_floating_point() and org_forwarded.is_floating_point() and value.dtype != org_forwarded.dtype:
+            return value.to(org_forwarded.dtype)
+        return value
+
     def apply_to(self):
         self.org_forward = self.org_module.forward
         self.org_module.forward = self.forward
@@ -108,8 +180,9 @@ class LoRAModule(torch.nn.Module):
             if torch.rand(1) < self.module_dropout:
                 return org_forwarded
 
+        lora_input = self._lora_input(x)
         if self.split_dims is None:
-            lx = self.lora_down(x)
+            lx = self.lora_down(lora_input)
 
             # normal dropout
             if self.dropout is not None and self.training:
@@ -122,6 +195,8 @@ class LoRAModule(torch.nn.Module):
                     mask = mask.unsqueeze(1)  # for Text Encoder
                 elif len(lx.size()) == 4:
                     mask = mask.unsqueeze(-1).unsqueeze(-1)  # for Conv2d
+                elif len(lx.size()) == 5:
+                    mask = mask.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)  # for Conv3d
                 lx = lx * mask
 
                 # scaling for rank dropout: treat as if the rank is changed
@@ -131,9 +206,10 @@ class LoRAModule(torch.nn.Module):
 
             lx = self.lora_up(lx)
 
-            return org_forwarded + lx * self.multiplier * scale
+            # Add in the (possibly higher-precision) delta dtype, then round the sum once.
+            return self._match_org_dtype(org_forwarded + lx * self.multiplier * scale, org_forwarded)
         else:
-            lxs = [lora_down(x) for lora_down in self.lora_down]
+            lxs = [lora_down(lora_input) for lora_down in self.lora_down]
 
             # normal dropout
             if self.dropout is not None and self.training:
@@ -156,7 +232,8 @@ class LoRAModule(torch.nn.Module):
 
             lxs = [lora_up(lx) for lora_up, lx in zip(self.lora_up, lxs)]
 
-            return org_forwarded + torch.cat(lxs, dim=-1) * self.multiplier * scale
+            # Add in the (possibly higher-precision) delta dtype, then round the sum once.
+            return self._match_org_dtype(org_forwarded + torch.cat(lxs, dim=-1) * self.multiplier * scale, org_forwarded)
 
 
 class LoRAInfModule(LoRAModule):
@@ -201,19 +278,37 @@ class LoRAInfModule(LoRAModule):
             if len(weight.size()) == 2:
                 # linear
                 weight = weight + self.multiplier * (up_weight @ down_weight) * self.scale
-            elif down_weight.size()[2:4] == (1, 1):
-                # conv2d 1x1
-                weight = (
-                    weight
-                    + self.multiplier
-                    * (up_weight.squeeze(3).squeeze(2) @ down_weight.squeeze(3).squeeze(2)).unsqueeze(2).unsqueeze(3)
-                    * self.scale
-                )
+            elif len(weight.size()) == 4:
+                if down_weight.size()[2:4] == (1, 1):
+                    # conv2d 1x1
+                    weight = (
+                        weight
+                        + self.multiplier
+                        * (up_weight.squeeze(3).squeeze(2) @ down_weight.squeeze(3).squeeze(2)).unsqueeze(2).unsqueeze(3)
+                        * self.scale
+                    )
+                else:
+                    # conv2d 3x3
+                    conved = torch.nn.functional.conv2d(down_weight.permute(1, 0, 2, 3), up_weight).permute(1, 0, 2, 3)
+                    # logger.info(conved.size(), weight.size(), module.stride, module.padding)
+                    weight = weight + self.multiplier * conved * self.scale
+            elif len(weight.size()) == 5:
+                if down_weight.size()[2:5] == (1, 1, 1):
+                    # conv3d 1x1x1
+                    weight = (
+                        weight
+                        + self.multiplier
+                        * (up_weight.squeeze(4).squeeze(3).squeeze(2) @ down_weight.squeeze(4).squeeze(3).squeeze(2))
+                        .unsqueeze(2)
+                        .unsqueeze(3)
+                        .unsqueeze(4)
+                        * self.scale
+                    )
+                else:
+                    conved = torch.nn.functional.conv3d(down_weight.permute(1, 0, 2, 3, 4), up_weight).permute(1, 0, 2, 3, 4)
+                    weight = weight + self.multiplier * conved * self.scale
             else:
-                # conv2d 3x3
-                conved = torch.nn.functional.conv2d(down_weight.permute(1, 0, 2, 3), up_weight).permute(1, 0, 2, 3)
-                # logger.info(conved.size(), weight.size(), module.stride, module.padding)
-                weight = weight + self.multiplier * conved * self.scale
+                raise ValueError(f"Unsupported LoRA target weight shape: {weight.size()}")
 
             # set weight to org_module
             org_sd["weight"] = weight.to(org_device, dtype=dtype)  # back to CPU without non_blocking
@@ -250,30 +345,52 @@ class LoRAInfModule(LoRAModule):
         if len(down_weight.size()) == 2:
             # linear
             weight = self.multiplier * (up_weight @ down_weight) * self.scale
-        elif down_weight.size()[2:4] == (1, 1):
-            # conv2d 1x1
-            weight = (
-                self.multiplier
-                * (up_weight.squeeze(3).squeeze(2) @ down_weight.squeeze(3).squeeze(2)).unsqueeze(2).unsqueeze(3)
-                * self.scale
-            )
+        elif len(down_weight.size()) == 4:
+            if down_weight.size()[2:4] == (1, 1):
+                # conv2d 1x1
+                weight = (
+                    self.multiplier
+                    * (up_weight.squeeze(3).squeeze(2) @ down_weight.squeeze(3).squeeze(2)).unsqueeze(2).unsqueeze(3)
+                    * self.scale
+                )
+            else:
+                # conv2d 3x3
+                conved = torch.nn.functional.conv2d(down_weight.permute(1, 0, 2, 3), up_weight).permute(1, 0, 2, 3)
+                weight = self.multiplier * conved * self.scale
+        elif len(down_weight.size()) == 5:
+            if down_weight.size()[2:5] == (1, 1, 1):
+                # conv3d 1x1x1
+                weight = (
+                    self.multiplier
+                    * (up_weight.squeeze(4).squeeze(3).squeeze(2) @ down_weight.squeeze(4).squeeze(3).squeeze(2))
+                    .unsqueeze(2)
+                    .unsqueeze(3)
+                    .unsqueeze(4)
+                    * self.scale
+                )
+            else:
+                conved = torch.nn.functional.conv3d(down_weight.permute(1, 0, 2, 3, 4), up_weight).permute(1, 0, 2, 3, 4)
+                weight = self.multiplier * conved * self.scale
         else:
-            # conv2d 3x3
-            conved = torch.nn.functional.conv2d(down_weight.permute(1, 0, 2, 3), up_weight).permute(1, 0, 2, 3)
-            weight = self.multiplier * conved * self.scale
+            raise ValueError(f"Unsupported LoRA weight shape: {down_weight.size()}")
 
         return weight
 
     def default_forward(self, x):
         # logger.info(f"default_forward {self.lora_name} {x.size()}")
+        lora_input = self._lora_input(x)
         if self.split_dims is None:
-            lx = self.lora_down(x)
+            lx = self.lora_down(lora_input)
             lx = self.lora_up(lx)
-            return self.org_forward(x) + lx * self.multiplier * self.scale
+            org_forwarded = self.org_forward(x)
+            # Add in the (possibly higher-precision) delta dtype, then round the sum once.
+            return self._match_org_dtype(org_forwarded + lx * self.multiplier * self.scale, org_forwarded)
         else:
-            lxs = [lora_down(x) for lora_down in self.lora_down]
+            lxs = [lora_down(lora_input) for lora_down in self.lora_down]
             lxs = [lora_up(lx) for lora_up, lx in zip(self.lora_up, lxs)]
-            return self.org_forward(x) + torch.cat(lxs, dim=-1) * self.multiplier * self.scale
+            org_forwarded = self.org_forward(x)
+            # Add in the (possibly higher-precision) delta dtype, then round the sum once.
+            return self._match_org_dtype(org_forwarded + torch.cat(lxs, dim=-1) * self.multiplier * self.scale, org_forwarded)
 
     def forward(self, x):
         if not self.enabled:
@@ -503,9 +620,11 @@ class LoRANetwork(torch.nn.Module):
                     for child_name, child_module in module.named_modules():
                         is_linear = child_module.__class__.__name__ == "Linear"
                         is_conv2d = child_module.__class__.__name__ == "Conv2d"
+                        is_conv3d = child_module.__class__.__name__ == "Conv3d"
                         is_conv2d_1x1 = is_conv2d and child_module.kernel_size == (1, 1)
+                        is_conv3d_1x1 = is_conv3d and child_module.kernel_size == (1, 1, 1)
 
-                        if is_linear or is_conv2d:
+                        if is_linear or is_conv2d or is_conv3d:
                             original_name = (name + "." if name else "") + child_name
                             lora_name = f"{pfx}.{original_name}".replace(".", "_")
 
@@ -539,7 +658,7 @@ class LoRANetwork(torch.nn.Module):
                                     alpha = modules_alpha[lora_name]
                             else:
                                 # 通常、すべて対象とする
-                                if is_linear or is_conv2d_1x1:
+                                if is_linear or is_conv2d_1x1 or is_conv3d_1x1:
                                     dim = default_dim if default_dim is not None else self.lora_dim
                                     alpha = self.alpha
                                 elif self.conv_lora_dim is not None:
@@ -548,7 +667,7 @@ class LoRANetwork(torch.nn.Module):
 
                             if dim is None or dim == 0:
                                 # skipした情報を出力
-                                if is_linear or is_conv2d_1x1 or (self.conv_lora_dim is not None):
+                                if is_linear or is_conv2d_1x1 or is_conv3d_1x1 or (self.conv_lora_dim is not None):
                                     skipped.append(lora_name)
                                 continue
 
@@ -699,29 +818,46 @@ class LoRANetwork(torch.nn.Module):
 
         all_params = []
         lr_descriptions = []
+        optimizer_group_patterns = parse_optimizer_group_patterns(kwargs.get("optimizer_group_patterns"))
 
         def assemble_params(loras, lr, loraplus_ratio):
-            param_groups = {"lora": {}, "plus": {}}
+            param_groups = {}
+            pattern_match_counts = {group["name"]: 0 for group in optimizer_group_patterns}
+
+            def get_bucket(param_kind: str, group_name: str):
+                key = (param_kind, group_name)
+                if key not in param_groups:
+                    param_groups[key] = {}
+                return param_groups[key]
+
             for lora in loras:
                 for name, param in lora.named_parameters():
-                    if loraplus_ratio is not None and "lora_up" in name:
-                        param_groups["plus"][f"{lora.lora_name}.{name}"] = param
-                    else:
-                        param_groups["lora"][f"{lora.lora_name}.{name}"] = param
+                    full_name = f"{lora.lora_name}.{name}"
+                    param_kind = "plus" if loraplus_ratio is not None and "lora_up" in name else "lora"
+                    matched_group = "default"
+                    for group in optimizer_group_patterns:
+                        if group["pattern"].fullmatch(full_name):
+                            matched_group = group["name"]
+                            pattern_match_counts[group["name"]] += 1
+                            break
+                    get_bucket(param_kind, matched_group)[full_name] = param
 
-            if loraplus_ratio is not None and len(param_groups["plus"]) == 0:
+            if loraplus_ratio is not None and not any(kind == "plus" for kind, _ in param_groups.keys()):
                 logger.warning("LoRA+ is not effective for this network type (no 'lora_up' parameters found)")
+            for group_name, match_count in pattern_match_counts.items():
+                if match_count == 0:
+                    logger.warning(f"optimizer_group_patterns group {group_name!r} did not match any parameters")
 
             params = []
             descriptions = []
-            for key in param_groups.keys():
-                param_data = {"params": param_groups[key].values()}
+            for (param_kind, group_name), grouped_params in param_groups.items():
+                param_data = {"params": grouped_params.values()}
 
                 if len(param_data["params"]) == 0:
                     continue
 
                 if lr is not None:
-                    if key == "plus":
+                    if param_kind == "plus":
                         param_data["lr"] = lr * loraplus_ratio
                     else:
                         param_data["lr"] = lr
@@ -731,7 +867,12 @@ class LoRANetwork(torch.nn.Module):
                     continue
 
                 params.append(param_data)
-                descriptions.append("plus" if key == "plus" else "")
+                description_parts = []
+                if param_kind == "plus":
+                    description_parts.append("plus")
+                if group_name != "default":
+                    description_parts.append(group_name)
+                descriptions.append(" ".join(description_parts))
 
             return params, descriptions
 

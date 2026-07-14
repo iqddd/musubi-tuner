@@ -5,8 +5,10 @@ import shutil
 from typing import Callable
 
 import accelerate
+import torch
 
 from musubi_tuner.utils import huggingface_utils
+from musubi_tuner.utils.model_utils import str_to_dtype
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -77,6 +79,51 @@ class LossRecorder:
     @property
     def moving_average(self) -> float:
         return self.loss_total / len(self.loss_list)
+
+
+def resize_spatial_mask(mask: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
+    leading_shape = mask.shape[:-2]
+    mask = mask.reshape(-1, 1, mask.shape[-2], mask.shape[-1])
+    mask = torch.nn.functional.interpolate(mask, size=size, mode="area")
+    return mask.reshape(*leading_shape, *size)
+
+
+def apply_alpha_masked_loss(loss: torch.Tensor, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+    alpha_mask = batch.get("alpha_mask")
+    if alpha_mask is None:
+        return loss
+
+    if alpha_mask.shape[0] != loss.shape[0]:
+        raise ValueError(f"alpha_mask batch size {alpha_mask.shape[0]} does not match loss batch size {loss.shape[0]}")
+
+    alpha_mask = alpha_mask.to(device=loss.device, dtype=loss.dtype)
+
+    if loss.ndim == 4:
+        # loss: B,C,H,W. If a multi-target mask slips in, use the first target.
+        if alpha_mask.ndim == 4:
+            alpha_mask = alpha_mask[:, 0]
+        alpha_mask = resize_spatial_mask(alpha_mask, loss.shape[-2:]).unsqueeze(1)
+        return loss * alpha_mask
+
+    if loss.ndim == 5:
+        if alpha_mask.ndim == 3:
+            # loss is usually B,C,F,H,W, but this also broadcasts over layered B,L,C,H,W.
+            alpha_mask = resize_spatial_mask(alpha_mask, loss.shape[-2:]).unsqueeze(1).unsqueeze(1)
+        elif alpha_mask.ndim == 4:
+            alpha_mask = resize_spatial_mask(alpha_mask, loss.shape[-2:])
+            if alpha_mask.shape[1] == loss.shape[1]:
+                # layered image layout: B,L,C,H,W
+                alpha_mask = alpha_mask.unsqueeze(2)
+            else:
+                # video/latent-frame layout: B,C,F,H,W
+                alpha_mask = alpha_mask.unsqueeze(1)
+        else:
+            raise ValueError(f"alpha_mask must be 3D or 4D for 5D loss, got shape {alpha_mask.shape}")
+        return loss * alpha_mask
+
+    # Some image architectures (for example patch-token models) use a non-spatial
+    # loss representation. They keep their existing reduction semantics.
+    return loss
 
 
 def get_epoch_ckpt_name(model_name, epoch_no: int):
@@ -181,3 +228,19 @@ def get_lin_function(x1: float = 256, y1: float = 0.5, x2: float = 4096, y2: flo
     m = (y2 - y1) / (x2 - x1)
     b = y1 - m * x1
     return lambda x: m * x + b
+
+
+def resolve_save_dtype(save_precision: str | None, full_fp16: bool = False, full_bf16: bool = False) -> torch.dtype:
+    """Resolve the dtype for saving network weights.
+
+    Explicit --save_precision wins; otherwise follow full_fp16/full_bf16 so the
+    saved weights match the training precision; otherwise fp32, the precision
+    the network weights are actually trained in.
+    """
+    if save_precision is not None:
+        return str_to_dtype(save_precision)
+    if full_fp16:
+        return torch.float16
+    if full_bf16:
+        return torch.bfloat16
+    return torch.float32
