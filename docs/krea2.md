@@ -135,7 +135,13 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 src/mus
 - Uses `krea2_train_network.py`.
 - **Requires** specifying `--dit` (RAW model) and `--vae` (Qwen-Image VAE).
 - **Requires** specifying `--network_module networks.lora_krea2`.
-- `--text_encoder` is only needed if you generate sample images during training (it is not needed for the training step itself, because text encoder outputs are pre-cached).
+- `--text_encoder` is needed if you generate sample images during training or enable `caption_dropout_rate` (otherwise it is not needed for the training step itself, because text encoder outputs are pre-cached).
+- `caption_dropout_rate` is an optional dataset setting in the range `0.0` to `1.0` (default `0.0`). It can be set in `[general]` or overridden per `[[datasets]]`. On each item read, the normal caption is replaced with the empty caption with this probability. The empty-caption embedding is encoded once at training startup, kept in shared CPU memory, and is not written to a cache file; enabling dropout does not require re-running `krea2_cache_text_encoder_outputs.py`.
+
+  ```toml
+  [general]
+  caption_dropout_rate = 0.1
+  ```
 - Krea 2 uses flow matching. `--timestep_sampling shift` with `--discrete_flow_shift` is a reasonable starting point. The value `2.5` matches the K2 inference time-shift at 1024×1024 (the schedule is resolution-aware: it ranges from about `1.6` at 256×256 to `3.2` at 1280×1280, reaching ~`2.5` at 1024×1024). For varying-resolution training, `--timestep_sampling krea2_shift` reproduces the same resolution-aware schedule per sample, so each timestep is shifted exactly as K2 shifts it at inference (default resolution range 256–1280); no fixed `--discrete_flow_shift` is needed in that case. (`--timestep_sampling flux_shift` is similar but its high end saturates at 1024px instead of 1280px, giving a slightly stronger shift above 256px.) The optimal settings are not yet established; feedback is welcome.
 - `--network_dim` / `--network_alpha` of 32 reproduces the model authors' recommended default. See [LoRA target layers](#lora-target-layers--loraの対象レイヤー) below.
 
@@ -147,7 +153,8 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 src/mus
 - `krea2_train_network.py`を使用します。
 - `--dit`（RAWモデル）と`--vae`（Qwen-Image VAE）を指定する必要があります。
 - `--network_module networks.lora_krea2`を指定する必要があります。
-- `--text_encoder`は学習中にサンプル画像を生成する場合にのみ必要です（テキストエンコーダー出力は事前キャッシュされるため、学習ステップ自体には不要です）。
+- `--text_encoder`は学習中にサンプル画像を生成する場合、または`caption_dropout_rate`を有効にする場合に必要です（それ以外ではテキストエンコーダー出力が事前キャッシュされるため、学習ステップ自体には不要です）。
+- `caption_dropout_rate`は`0.0`から`1.0`までのオプションのデータセット設定です（デフォルトは`0.0`）。`[general]`に設定するか、各`[[datasets]]`で上書きできます。各項目の読み込み時に、この確率で通常のcaptionを空のcaptionに置き換えます。空captionのembeddingは学習開始時に一度だけエンコードされ、共有CPUメモリに保持されます。cacheファイルには書き込まれないため、dropoutを有効にするだけなら`krea2_cache_text_encoder_outputs.py`を再実行する必要はありません。
 - Krea 2はflow matchingを使用します。`--timestep_sampling shift`と`--discrete_flow_shift`の組み合わせが出発点として妥当です。値 `2.5` は1024×1024でのK2推論時のtime-shiftに一致します（このスケジュールは解像度依存で、256×256で約 `1.6`、1280×1280で約 `3.2`、1024×1024で約 `2.5` です）。解像度を変えて学習する場合は、`--timestep_sampling krea2_shift` を使うと同じ解像度依存スケジュールをサンプルごとに再現し、各タイムステップがK2推論時とまったく同じようにシフトされます（デフォルトの解像度レンジ256〜1280）。この場合は固定の `--discrete_flow_shift` は不要です。（`--timestep_sampling flux_shift` も類似ですが、高解像度側が1024px（K2は1280px）で飽和するため、256pxより上ではやや強いshiftになります。）最適な設定はまだ確立されていません。フィードバックをお待ちしています。
 - `--network_dim` / `--network_alpha` を32にすると、モデル作者が推奨するデフォルト設定を再現します。下記の[LoRAの対象レイヤー](#lora-target-layers--loraの対象レイヤー)を参照してください。
 

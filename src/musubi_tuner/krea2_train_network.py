@@ -94,41 +94,31 @@ class Krea2NetworkTrainer(NetworkTrainer):
         if args.turbo_dit and not args.sample_prompts:
             logger.warning("--turbo_dit is set but --sample_prompts is not; Turbo is only used for sample generation.")
 
-    def process_sample_prompts(
-        self,
-        args: argparse.Namespace,
-        accelerator: Accelerator,
-        sample_prompts: str,
-    ):
-        """Encode the sample prompts with Qwen3-VL up front, cache the embeds, free the encoder.
-
-        Kept deliberately simple (text-to-image only): for each prompt and its optional
-        negative prompt we store the varlen selected-layer hidden stack (valid tokens only),
-        matching the training cache format, then drop the 4B encoder before training resumes.
-        """
+    def _encode_training_prompts(
+        self, args: argparse.Namespace, accelerator: Accelerator, prompt_texts: list[str]
+    ) -> dict[str, torch.Tensor]:
+        """Encode unique prompts to the varlen CPU format used by Krea 2 training."""
         device = accelerator.device
-
-        assert args.text_encoder is not None, "--text_encoder is required for sample generation during training"
-        logger.info(f"cache Text Encoder outputs for sample prompt: {sample_prompts}")
-        prompts = load_prompts(sample_prompts)
+        if args.text_encoder is None:
+            raise ValueError("--text_encoder is required for Krea 2 caption dropout or sample generation during training")
 
         encoder = krea2_utils.load_krea2_text_encoder(args.text_encoder, dtype=torch.bfloat16, device=device)
 
-        logger.info("Encoding sample prompts with Qwen3-VL")
+        logger.info("Encoding training-time prompts with Qwen3-VL")
         te_outputs = {}  # prompt str -> (valid_len, num_layers, hidden) on cpu
         with torch.no_grad():
-            for prompt_dict in prompts:
-                for p in [prompt_dict.get("prompt", ""), prompt_dict.get("negative_prompt", None)]:
-                    if p is None or p in te_outputs:
-                        continue
-                    hiddens, mask = krea2_utils.get_krea2_prompt_embeds(encoder, [p])  # (1, seq, L, D), (1, seq)
-                    embed = hiddens[0][mask[0]]  # gather valid tokens -> (valid_len, L, D), drops padding
-                    te_outputs[p] = embed.to("cpu")
+            for prompt in dict.fromkeys(prompt_texts):
+                hiddens, mask = krea2_utils.get_krea2_prompt_embeds(encoder, [prompt])  # (1, seq, L, D), (1, seq)
+                embed = hiddens[0][mask[0]]  # gather valid tokens -> (valid_len, L, D), drops padding
+                te_outputs[prompt] = embed.detach().to("cpu").contiguous()
 
         del encoder
         gc.collect()
         clean_memory_on_device(device)
+        return te_outputs
 
+    @staticmethod
+    def _build_sample_parameters(prompts: list[dict], te_outputs: dict[str, torch.Tensor]) -> list[dict]:
         sample_parameters = []
         for prompt_dict in prompts:
             prompt_dict_copy = prompt_dict.copy()
@@ -137,9 +127,61 @@ class Krea2NetworkTrainer(NetworkTrainer):
             if negative_prompt is not None:
                 prompt_dict_copy["negative_krea2_vl_embed"] = te_outputs[negative_prompt]
             sample_parameters.append(prompt_dict_copy)
-
-        clean_memory_on_device(device)
         return sample_parameters
+
+    def process_sample_prompts(
+        self,
+        args: argparse.Namespace,
+        accelerator: Accelerator,
+        sample_prompts: str,
+    ):
+        """Encode sample prompts up front, cache the embeds, and free Qwen3-VL."""
+        logger.info(f"cache Text Encoder outputs for sample prompt: {sample_prompts}")
+        prompts = load_prompts(sample_prompts)
+        prompt_texts = []
+        for prompt_dict in prompts:
+            prompt_texts.append(prompt_dict.get("prompt", ""))
+            negative_prompt = prompt_dict.get("negative_prompt", None)
+            if negative_prompt is not None:
+                prompt_texts.append(negative_prompt)
+
+        te_outputs = self._encode_training_prompts(args, accelerator, prompt_texts)
+        sample_parameters = self._build_sample_parameters(prompts, te_outputs)
+
+        clean_memory_on_device(accelerator.device)
+        return sample_parameters
+
+    def _prepare_sampling(self, args, accelerator, vae_dtype, train_dataset_group):
+        dropout_datasets = [dataset for dataset in train_dataset_group.datasets if dataset.caption_dropout_rate > 0.0]
+        if not dropout_datasets:
+            return super()._prepare_sampling(args, accelerator, vae_dtype, train_dataset_group)
+
+        if args.text_encoder is None:
+            raise ValueError("--text_encoder is required when Krea 2 caption_dropout_rate is greater than zero")
+
+        prompts = load_prompts(args.sample_prompts) if args.sample_prompts else []
+        prompt_texts = [""]
+        for prompt_dict in prompts:
+            prompt_texts.append(prompt_dict.get("prompt", ""))
+            negative_prompt = prompt_dict.get("negative_prompt", None)
+            if negative_prompt is not None:
+                prompt_texts.append(negative_prompt)
+
+        te_outputs = self._encode_training_prompts(args, accelerator, prompt_texts)
+        empty_caption_embedding = te_outputs[""]
+        empty_caption_embedding.share_memory_()
+        for dataset in dropout_datasets:
+            dataset.set_caption_dropout_embedding(empty_caption_embedding)
+
+        sample_parameters = self._build_sample_parameters(prompts, te_outputs) if prompts else None
+        vae = None
+        if args.sample_prompts:
+            vae = self.load_vae(args, vae_dtype=vae_dtype, vae_path=args.vae)
+            vae.requires_grad_(False)
+            vae.eval()
+
+        clean_memory_on_device(accelerator.device)
+        return sample_parameters, vae
 
     def do_inference(
         self,

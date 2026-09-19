@@ -1418,7 +1418,7 @@ class NetworkTrainer:
         session_id, training_started_at = self._init_session(args)
         train_dataset_group, collator, current_epoch = self._build_dataset(args)
         accelerator, weight_dtype, dit_dtype, dit_weight_dtype, vae_dtype = self._prepare_accelerator_and_dtypes(args)
-        sample_parameters, vae = self._prepare_sampling(args, accelerator, vae_dtype)
+        sample_parameters, vae = self._prepare_sampling(args, accelerator, vae_dtype, train_dataset_group)
         transformer = self._load_dit_and_swap(args, accelerator, dit_weight_dtype)
         network = self._build_network(args, accelerator, transformer, vae, weight_dtype)
         if network is None:
@@ -1580,7 +1580,7 @@ class NetworkTrainer:
         vae_dtype = torch.float16 if args.vae_dtype is None else model_utils.str_to_dtype(args.vae_dtype)
         return accelerator, weight_dtype, dit_dtype, dit_weight_dtype, vae_dtype
 
-    def _prepare_sampling(self, args, accelerator, vae_dtype):
+    def _prepare_sampling(self, args, accelerator, vae_dtype, train_dataset_group):
         # get embedding for sampling images
         sample_parameters = None
         vae = None

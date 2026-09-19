@@ -176,6 +176,7 @@ class BucketBatchManager:
         batch_size: int,
         num_timestep_buckets: Optional[int] = None,
         caption_selection_seed: Optional[int] = None,
+        caption_dropout_rate: float = 0.0,
     ):
         self.batch_size = batch_size
         self.buckets = bucketed_item_info
@@ -184,6 +185,8 @@ class BucketBatchManager:
         self.num_timestep_buckets = num_timestep_buckets
         self.timestep_pool = None
         self.caption_selection_seed = caption_selection_seed
+        self.caption_dropout_rate = float(caption_dropout_rate)
+        self.caption_dropout_embedding: Optional[torch.Tensor] = None
         self.current_epoch = 0
 
         # indices for enumerating batches. each batch is reso + batch_idx. reso is (width, height) or (width, height, frames)
@@ -246,6 +249,13 @@ class BucketBatchManager:
     def set_current_epoch(self, epoch: int):
         self.current_epoch = epoch
 
+    def set_caption_dropout_embedding(self, embedding: torch.Tensor) -> None:
+        if embedding.device.type != "cpu":
+            raise ValueError("caption dropout embedding must be stored on CPU")
+        if embedding.dim() != 3:
+            raise ValueError("Krea 2 caption dropout embedding must have shape (valid_len, num_layers, hidden)")
+        self.caption_dropout_embedding = embedding.contiguous()
+
     @staticmethod
     def _select_krea2_caption_index(
         candidate_count: int, seed: int, epoch: int, dataset_index: int, item_offset: int, item_key: str
@@ -305,8 +315,18 @@ class BucketBatchManager:
         varlen_keys = set()
         for item_offset, item_info in enumerate(bucket[start:end]):
             sd_latent = load_file(item_info.latent_cache_path)
-            sd_te = load_file(item_info.text_encoder_output_cache_path)
-            self._select_krea2_caption_embed(sd_te, item_info, idx, item_offset)
+            if self.caption_dropout_rate > 0.0:
+                if self.caption_dropout_embedding is None:
+                    raise RuntimeError("Krea 2 caption dropout embedding was not prepared before reading the dataset")
+                use_empty_caption = random.random() < self.caption_dropout_rate
+            else:
+                use_empty_caption = False
+
+            if use_empty_caption:
+                sd_te = {"varlen_krea2_vl_embed": self.caption_dropout_embedding}
+            else:
+                sd_te = load_file(item_info.text_encoder_output_cache_path)
+                self._select_krea2_caption_embed(sd_te, item_info, idx, item_offset)
             sd = {**sd_latent, **sd_te}
 
             # TODO refactor this

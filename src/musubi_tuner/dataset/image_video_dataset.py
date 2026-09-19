@@ -34,6 +34,7 @@ from musubi_tuner.dataset.architectures import (  # explicit imports for local u
     ARCHITECTURE_HUNYUAN_VIDEO,
     ARCHITECTURE_HUNYUAN_VIDEO_1_5,
     ARCHITECTURE_KANDINSKY5,
+    ARCHITECTURE_KREA2,
     ARCHITECTURE_QWEN_IMAGE_EDIT,
     ARCHITECTURE_WAN,
 )
@@ -119,6 +120,7 @@ class BaseDataset(torch.utils.data.Dataset):
         cache_directory: Optional[str] = None,
         debug_dataset: bool = False,
         architecture: str = "no_default",
+        caption_dropout_rate: float = 0.0,
     ):
         self.resolution = resolution
         self.caption_extension = caption_extension
@@ -129,6 +131,11 @@ class BaseDataset(torch.utils.data.Dataset):
         self.cache_directory = cache_directory
         self.debug_dataset = debug_dataset
         self.architecture = architecture
+        self.caption_dropout_rate = float(caption_dropout_rate)
+        if not 0.0 <= self.caption_dropout_rate <= 1.0:
+            raise ValueError(f"caption_dropout_rate must be between 0.0 and 1.0, got {self.caption_dropout_rate}")
+        if self.caption_dropout_rate > 0.0 and self.architecture != ARCHITECTURE_KREA2:
+            raise ValueError("caption_dropout_rate is currently supported only for Krea 2 datasets")
         self.seed = None
         self.current_epoch = 0
         self.shared_epoch = None
@@ -144,6 +151,7 @@ class BaseDataset(torch.utils.data.Dataset):
             "num_repeats": self.num_repeats,
             "enable_bucket": bool(self.enable_bucket),
             "bucket_no_upscale": bool(self.bucket_no_upscale),
+            "caption_dropout_rate": self.caption_dropout_rate,
         }
         return metadata
 
@@ -182,6 +190,13 @@ class BaseDataset(torch.utils.data.Dataset):
 
     def prepare_for_training(self, num_timestep_buckets: Optional[int] = None):
         pass
+
+    def set_caption_dropout_embedding(self, embedding: torch.Tensor) -> None:
+        if self.caption_dropout_rate <= 0.0:
+            return
+        if self.batch_manager is None:
+            raise RuntimeError("caption dropout embedding cannot be set before the dataset is prepared for training")
+        self.batch_manager.set_caption_dropout_embedding(embedding)
 
     def set_seed(self, seed: int, shared_epoch: SharedEpoch):
         self.seed = seed
@@ -305,6 +320,7 @@ class ImageDataset(BaseDataset):
         control_resolution: Optional[Tuple[int, int]] = None,
         debug_dataset: bool = False,
         architecture: str = "no_default",
+        caption_dropout_rate: float = 0.0,
     ):
         super(ImageDataset, self).__init__(
             resolution,
@@ -316,6 +332,7 @@ class ImageDataset(BaseDataset):
             cache_directory,
             debug_dataset,
             architecture,
+            caption_dropout_rate,
         )
         self.image_directory = image_directory
         self.image_jsonl_file = image_jsonl_file
@@ -583,6 +600,7 @@ class ImageDataset(BaseDataset):
             self.batch_size,
             num_timestep_buckets=num_timestep_buckets,
             caption_selection_seed=self.seed,
+            caption_dropout_rate=self.caption_dropout_rate,
         )
         self.batch_manager.show_bucket_info()
 
@@ -631,6 +649,7 @@ class VideoDataset(BaseDataset):
         fp_latent_window_size: Optional[int] = 9,
         debug_dataset: bool = False,
         architecture: str = "no_default",
+        caption_dropout_rate: float = 0.0,
     ):
         super(VideoDataset, self).__init__(
             resolution,
@@ -642,6 +661,7 @@ class VideoDataset(BaseDataset):
             cache_directory,
             debug_dataset,
             architecture,
+            caption_dropout_rate,
         )
         self.video_directory = video_directory
         self.video_jsonl_file = video_jsonl_file

@@ -19,7 +19,7 @@ SharedEpoch = Optional["Synchronized[int]"]
 
 import toml
 import voluptuous
-from voluptuous import Any, ExactSequence, MultipleInvalid, Object, Schema
+from voluptuous import All, Any, Coerce, ExactSequence, MultipleInvalid, Object, Range, Schema
 
 from musubi_tuner.dataset.image_video_dataset import DatasetGroup, ImageDataset, VideoDataset
 
@@ -40,6 +40,7 @@ class BaseDatasetParams:
     cache_directory: Optional[str] = None
     debug_dataset: bool = False
     architecture: str = "no_default"  # short style like "hv" or "wan"
+    caption_dropout_rate: float = 0.0
 
 
 @dataclass
@@ -116,6 +117,7 @@ class ConfigSanitizer:
         "resolution": functools.partial(__validate_and_convert_scalar_or_twodim.__func__, int),
         "enable_bucket": bool,
         "bucket_no_upscale": bool,
+        "caption_dropout_rate": All(Coerce(float), Range(min=0.0, max=1.0)),
     }
     IMAGE_DATASET_DISTINCT_SCHEMA = {
         "image_directory": str,
@@ -305,6 +307,7 @@ def generate_dataset_group_by_blueprint(
         caption_extension: "{dataset.caption_extension}"
         enable_bucket: {dataset.enable_bucket}
         bucket_no_upscale: {dataset.bucket_no_upscale}
+        caption_dropout_rate: {dataset.caption_dropout_rate}
         cache_directory: "{dataset.cache_directory}"
         debug_dataset: {dataset.debug_dataset}
     """
