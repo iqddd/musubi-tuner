@@ -108,17 +108,14 @@ def test_bucket_batch_carries_one_dataset_loss_multiplier(tmp_path):
     assert manager[0]["loss_multiplier"] == 3.0
 
 
-def test_trainer_scales_complete_loss_once_and_reports_multiplier():
+def test_trainer_scales_complete_loss_once():
     primary_loss = torch.tensor(2.0, requires_grad=True)
     auxiliary_loss = torch.tensor(3.0, requires_grad=True)
 
-    scaled_loss, multiplier = NetworkTrainer.apply_dataset_loss_multiplier(
-        primary_loss + auxiliary_loss, {"loss_multiplier": 4.0}
-    )
+    scaled_loss = NetworkTrainer.apply_dataset_loss_multiplier(primary_loss + auxiliary_loss, {"loss_multiplier": 4.0})
     scaled_loss.backward()
 
     assert scaled_loss.item() == 20.0
-    assert multiplier == 4.0
     assert primary_loss.grad.item() == 4.0
     assert auxiliary_loss.grad.item() == 4.0
 
@@ -126,18 +123,17 @@ def test_trainer_scales_complete_loss_once_and_reports_multiplier():
 def test_trainer_default_multiplier_preserves_loss_and_gradient():
     loss = torch.tensor(7.0, requires_grad=True)
 
-    scaled_loss, multiplier = NetworkTrainer.apply_dataset_loss_multiplier(loss, {})
+    scaled_loss = NetworkTrainer.apply_dataset_loss_multiplier(loss, {})
     scaled_loss.backward()
 
     assert scaled_loss.item() == 7.0
-    assert multiplier == 1.0
     assert loss.grad.item() == 1.0
 
 
 def test_trainer_multiplier_preserves_bfloat16_loss_and_gradient_dtype():
     loss = torch.tensor(2.0, dtype=torch.bfloat16, requires_grad=True)
 
-    scaled_loss, _ = NetworkTrainer.apply_dataset_loss_multiplier(loss, {"loss_multiplier": 1.5})
+    scaled_loss = NetworkTrainer.apply_dataset_loss_multiplier(loss, {"loss_multiplier": 1.5})
     scaled_loss.backward()
 
     assert scaled_loss.dtype == torch.bfloat16

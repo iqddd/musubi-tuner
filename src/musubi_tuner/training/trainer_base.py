@@ -1247,14 +1247,14 @@ class NetworkTrainer:
         return self.compute_loss(args, output, timesteps, noise_scheduler, dit_dtype, network_dtype, global_step, batch)
 
     @staticmethod
-    def apply_dataset_loss_multiplier(loss: torch.Tensor, batch: dict[str, Any]) -> tuple[torch.Tensor, float]:
+    def apply_dataset_loss_multiplier(loss: torch.Tensor, batch: dict[str, Any]) -> torch.Tensor:
         """Scale the complete per-batch loss by its dataset-level multiplier."""
         loss_multiplier = float(batch.get("loss_multiplier", 1.0))
         # Match the scalar to the already-computed loss. In mixed precision the
         # loss may intentionally be fp32 even when the model runs in bf16, so do
         # not force either an upcast or a downcast here.
         typed_multiplier = loss.new_tensor(loss_multiplier)
-        return loss * typed_multiplier, loss_multiplier
+        return loss * typed_multiplier
 
     def compute_loss(
         self,
@@ -2169,8 +2169,7 @@ class NetworkTrainer:
                         global_step,
                     )
 
-                    loss, loss_multiplier = self.apply_dataset_loss_multiplier(loss, batch)
-                    loss_metrics["loss/dataset_multiplier"] = loss_multiplier
+                    loss = self.apply_dataset_loss_multiplier(loss, batch)
 
                     accelerator.backward(loss)
                     if accelerator.sync_gradients:
