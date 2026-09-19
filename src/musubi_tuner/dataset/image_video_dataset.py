@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 import glob
+import math
 import os
 import random
 import time
@@ -121,6 +122,7 @@ class BaseDataset(torch.utils.data.Dataset):
         debug_dataset: bool = False,
         architecture: str = "no_default",
         caption_dropout_rate: float = 0.0,
+        loss_multiplier: float = 1.0,
     ):
         self.resolution = resolution
         self.caption_extension = caption_extension
@@ -136,6 +138,11 @@ class BaseDataset(torch.utils.data.Dataset):
             raise ValueError(f"caption_dropout_rate must be between 0.0 and 1.0, got {self.caption_dropout_rate}")
         if self.caption_dropout_rate > 0.0 and self.architecture != ARCHITECTURE_KREA2:
             raise ValueError("caption_dropout_rate is currently supported only for Krea 2 datasets")
+        self.loss_multiplier = float(loss_multiplier)
+        if not math.isfinite(self.loss_multiplier) or self.loss_multiplier < 0.0:
+            raise ValueError(
+                f"loss_multiplier must be a finite number greater than or equal to 0.0, got {self.loss_multiplier}"
+            )
         self.seed = None
         self.current_epoch = 0
         self.shared_epoch = None
@@ -152,6 +159,7 @@ class BaseDataset(torch.utils.data.Dataset):
             "enable_bucket": bool(self.enable_bucket),
             "bucket_no_upscale": bool(self.bucket_no_upscale),
             "caption_dropout_rate": self.caption_dropout_rate,
+            "loss_multiplier": self.loss_multiplier,
         }
         return metadata
 
@@ -321,6 +329,7 @@ class ImageDataset(BaseDataset):
         debug_dataset: bool = False,
         architecture: str = "no_default",
         caption_dropout_rate: float = 0.0,
+        loss_multiplier: float = 1.0,
     ):
         super(ImageDataset, self).__init__(
             resolution,
@@ -333,6 +342,7 @@ class ImageDataset(BaseDataset):
             debug_dataset,
             architecture,
             caption_dropout_rate,
+            loss_multiplier,
         )
         self.image_directory = image_directory
         self.image_jsonl_file = image_jsonl_file
@@ -601,6 +611,7 @@ class ImageDataset(BaseDataset):
             num_timestep_buckets=num_timestep_buckets,
             caption_selection_seed=self.seed,
             caption_dropout_rate=self.caption_dropout_rate,
+            loss_multiplier=self.loss_multiplier,
         )
         self.batch_manager.show_bucket_info()
 
@@ -650,6 +661,7 @@ class VideoDataset(BaseDataset):
         debug_dataset: bool = False,
         architecture: str = "no_default",
         caption_dropout_rate: float = 0.0,
+        loss_multiplier: float = 1.0,
     ):
         super(VideoDataset, self).__init__(
             resolution,
@@ -662,6 +674,7 @@ class VideoDataset(BaseDataset):
             debug_dataset,
             architecture,
             caption_dropout_rate,
+            loss_multiplier,
         )
         self.video_directory = video_directory
         self.video_jsonl_file = video_jsonl_file
@@ -942,6 +955,7 @@ class VideoDataset(BaseDataset):
             self.batch_size,
             num_timestep_buckets=num_timestep_buckets,
             caption_selection_seed=self.seed,
+            loss_multiplier=self.loss_multiplier,
         )
         self.batch_manager.show_bucket_info()
 

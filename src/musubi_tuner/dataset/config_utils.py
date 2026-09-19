@@ -4,6 +4,7 @@ from dataclasses import (
     dataclass,
 )
 import functools
+import math
 import random
 from textwrap import dedent, indent
 import json
@@ -41,6 +42,7 @@ class BaseDatasetParams:
     debug_dataset: bool = False
     architecture: str = "no_default"  # short style like "hv" or "wan"
     caption_dropout_rate: float = 0.0
+    loss_multiplier: float = 1.0
 
 
 @dataclass
@@ -109,6 +111,13 @@ class ConfigSanitizer:
         except:
             return ConfigSanitizer.__validate_and_convert_twodim(klass, value)
 
+    @staticmethod
+    def __validate_loss_multiplier(value: float) -> float:
+        value = float(value)
+        if not math.isfinite(value) or value < 0.0:
+            raise voluptuous.Invalid("loss_multiplier must be a finite number greater than or equal to 0.0")
+        return value
+
     # datasets schema
     DATASET_ASCENDABLE_SCHEMA = {
         "caption_extension": str,
@@ -118,6 +127,7 @@ class ConfigSanitizer:
         "enable_bucket": bool,
         "bucket_no_upscale": bool,
         "caption_dropout_rate": All(Coerce(float), Range(min=0.0, max=1.0)),
+        "loss_multiplier": All(Coerce(float), __validate_loss_multiplier.__func__),
     }
     IMAGE_DATASET_DISTINCT_SCHEMA = {
         "image_directory": str,
@@ -308,6 +318,7 @@ def generate_dataset_group_by_blueprint(
         enable_bucket: {dataset.enable_bucket}
         bucket_no_upscale: {dataset.bucket_no_upscale}
         caption_dropout_rate: {dataset.caption_dropout_rate}
+        loss_multiplier: {dataset.loss_multiplier}
         cache_directory: "{dataset.cache_directory}"
         debug_dataset: {dataset.debug_dataset}
     """

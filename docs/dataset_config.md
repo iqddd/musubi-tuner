@@ -24,7 +24,7 @@ Each video is extracted frame by frame without additional processing and used fo
 ### Sample for Image Dataset with Caption Text Files
 
 ```toml
-# resolution, caption_extension, batch_size, num_repeats, enable_bucket, bucket_no_upscale should be set in either general or datasets
+# resolution, caption_extension, batch_size, num_repeats, loss_multiplier, enable_bucket, bucket_no_upscale should be set in either general or datasets
 # otherwise, the default values will be used for each item
 
 # general configurations
@@ -39,6 +39,7 @@ bucket_no_upscale = false
 image_directory = "/path/to/image_dir"
 cache_directory = "/path/to/cache_directory"
 num_repeats = 1 # optional, default is 1. Number of times to repeat the dataset. Useful to balance the multiple datasets with different sizes.
+# loss_multiplier = 1.5 # optional, default is 1.0. Overrides the general value for this dataset.
 # multiple_target = true # optional, default is false. Set to true for Qwen-Image-Layered training.
 
 # other datasets can be added here. each dataset can have different configurations
@@ -49,6 +50,8 @@ num_repeats = 1 # optional, default is 1. Number of times to repeat the dataset.
 `cache_directory` is optional, default is None to use the same directory as the image directory. However, we recommend to set the cache directory to avoid accidental sharing of the cache files between different datasets.
 
 `num_repeats` is also available. It is optional, default is 1 (no repeat). It repeats the images (or videos) that many times to expand the dataset. For example, if `num_repeats = 2` and there are 20 images in the dataset, each image will be duplicated twice (with the same caption) to have a total of 40 images. It is useful to balance the multiple datasets with different sizes.
+
+`loss_multiplier` is an optional non-negative finite number with a default of `1.0`. It can be set in `[general]` and overridden in an individual `[[datasets]]` section. For LoRA/network training, it scales the complete loss of each batch from that dataset after timestep weighting and architecture-specific auxiliary losses, but before backpropagation. Unlike `num_repeats`, it changes gradient strength rather than how often the dataset is sampled. Dedicated full-finetuning scripts do not use this setting.
 
 For Qwen-Image-Layered training, set `multiple_target = true`. Also, in the `image_directory`, for each "image to be trained + segmentation (layer) results" combination, store the following (if `caption_extension` is `.txt`):
 
@@ -69,7 +72,9 @@ The next combination would be stored as `/path/to/layer_images/image2.txt` for c
 
 `num_repeats` はオプションで、デフォルトは 1 です（繰り返しなし）。画像（や動画）を、その回数だけ単純に繰り返してデータセットを拡張します。たとえば`num_repeats = 2`としたとき、画像20枚のデータセットなら、各画像が2枚ずつ（同一のキャプションで）計40枚存在した場合と同じになります。異なるデータ数のデータセット間でバランスを取るために使用可能です。
 
-resolution, caption_extension, batch_size, num_repeats, enable_bucket, bucket_no_upscale は general または datasets のどちらかに設定してください。省略時は各項目のデフォルト値が使用されます。
+`loss_multiplier` は有限かつ非負のオプション値で、デフォルトは `1.0` です。`[general]` に設定し、個別の `[[datasets]]` で上書きできます。LoRA/network 学習では、timestep weighting とアーキテクチャ固有の補助 loss を含む、そのデータセット由来の batch の loss 全体を backpropagation の直前に乗算します。`num_repeats` がサンプリング頻度を変えるのに対し、`loss_multiplier` は勾配の強さを変えます。専用の full-finetuning スクリプトでは使用されません。
+
+resolution, caption_extension, batch_size, num_repeats, loss_multiplier, enable_bucket, bucket_no_upscale は general または datasets のどちらかに設定してください。省略時は各項目のデフォルト値が使用されます。
 
 `[[datasets]]`以下を追加することで、他のデータセットを追加できます。各データセットには異なる設定を持てます。
 

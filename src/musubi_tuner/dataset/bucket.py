@@ -177,6 +177,7 @@ class BucketBatchManager:
         num_timestep_buckets: Optional[int] = None,
         caption_selection_seed: Optional[int] = None,
         caption_dropout_rate: float = 0.0,
+        loss_multiplier: float = 1.0,
     ):
         self.batch_size = batch_size
         self.buckets = bucketed_item_info
@@ -186,6 +187,7 @@ class BucketBatchManager:
         self.timestep_pool = None
         self.caption_selection_seed = caption_selection_seed
         self.caption_dropout_rate = float(caption_dropout_rate)
+        self.loss_multiplier = float(loss_multiplier)
         self.caption_dropout_embedding: Optional[torch.Tensor] = None
         self.current_epoch = 0
 
@@ -359,5 +361,9 @@ class BucketBatchManager:
             batch_tensor_data["timesteps"] = self.timestep_pool[idx][: end - start]  # use the pre-generated timesteps
         else:
             batch_tensor_data["timesteps"] = None
+
+        # A bucket batch always contains items from exactly one dataset, so a
+        # single scalar carries its loss weight to the training loop.
+        batch_tensor_data["loss_multiplier"] = self.loss_multiplier
 
         return batch_tensor_data
