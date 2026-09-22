@@ -21,6 +21,72 @@ from musubi_tuner.modules.attention import AttentionParams, attention as common_
 from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig, create_offloader
 
 
+def pack_valid_prefix(
+    sequence: Tensor,
+    pos: Tensor,
+    valid_mask: Tensor,
+    pad_multiple: int = 256,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, int]:
+    """Stably pack valid tokens to a per-sample prefix and trim the invalid tail.
+
+    Returns the packed sequence/positions/mask, the permutation from packed to
+    original indices, and the original sequence length. The physical packed
+    length is the largest valid length in the batch rounded up to
+    ``pad_multiple``.
+    """
+    if sequence.ndim != 3 or pos.ndim != 3 or valid_mask.ndim != 2:
+        raise ValueError("sequence/pos/valid_mask must have shapes BxLxD, BxLx3 and BxL")
+    if sequence.shape[:2] != pos.shape[:2] or sequence.shape[:2] != valid_mask.shape:
+        raise ValueError(
+            f"sequence, pos and valid_mask sequence shapes differ: "
+            f"{sequence.shape[:2]}, {pos.shape[:2]}, {valid_mask.shape}"
+        )
+    if valid_mask.dtype != torch.bool:
+        raise ValueError(f"valid_mask must be bool, got {valid_mask.dtype}")
+    if pad_multiple <= 0:
+        raise ValueError(f"pad_multiple must be positive, got {pad_multiple}")
+
+    valid_lengths = valid_mask.sum(dim=1)
+    if torch.any(valid_lengths == 0):
+        raise ValueError("each packed sequence must contain at least one valid token")
+
+    # Stable sorting preserves image raster order and text order. Since the
+    # input is [image, text], valid image tokens continue to precede valid text.
+    permutation = torch.argsort(valid_mask.to(torch.int8), dim=1, descending=True, stable=True)
+    original_length = sequence.shape[1]
+    max_valid = int(valid_lengths.max().item())
+    packed_length = ((max_valid + pad_multiple - 1) // pad_multiple) * pad_multiple
+    gathered_length = min(original_length, packed_length)
+    gather_indices = permutation[:, :gathered_length]
+
+    sequence = torch.gather(sequence, 1, gather_indices.unsqueeze(-1).expand(-1, -1, sequence.shape[-1]))
+    pos = torch.gather(pos, 1, gather_indices.unsqueeze(-1).expand(-1, -1, pos.shape[-1]))
+    packed_mask = torch.arange(packed_length, device=valid_mask.device)[None] < valid_lengths[:, None]
+
+    pad_length = packed_length - gathered_length
+    if pad_length > 0:
+        sequence = F.pad(sequence, (0, 0, 0, pad_length))
+        pos = F.pad(pos, (0, 0, 0, pad_length))
+
+    return sequence, pos, packed_mask, permutation, original_length
+
+
+def unpack_packed_sequence(
+    packed: Tensor,
+    packed_mask: Tensor,
+    permutation: Tensor,
+    original_length: int,
+) -> Tensor:
+    """Scatter a packed sequence back; invalid/trimmed tokens become zero."""
+    if packed.shape[:2] != packed_mask.shape:
+        raise ValueError(f"packed and packed_mask shapes differ: {packed.shape[:2]} vs {packed_mask.shape}")
+    gathered_length = min(original_length, packed.shape[1])
+    indices = permutation[:, :gathered_length]
+    source = packed[:, :gathered_length] * packed_mask[:, :gathered_length, None].to(packed.dtype)
+    output = packed.new_zeros(packed.shape[0], original_length, packed.shape[-1])
+    return output.scatter(1, indices.unsqueeze(-1).expand(-1, -1, packed.shape[-1]), source)
+
+
 def rope(pos: Tensor, dim: int, theta: float = 1e4, ntk: float = 1.0) -> Tensor:
     scale = torch.arange(0, dim, 2, dtype=torch.float64, device=pos.device) / dim
     omega = 1.0 / ((theta * ntk) ** scale)
@@ -398,6 +464,7 @@ class SingleStreamDiT(nn.Module):
         t: Tensor,
         pos: Tensor,
         mask: Tensor | None = None,
+        image_mask: Tensor | None = None,
     ) -> Tensor:
         img = self.first(img)
         t = self.tmlp(temb(t, self.config.tdim, device=img.device, dtype=img.dtype))
@@ -416,21 +483,33 @@ class SingleStreamDiT(nn.Module):
         context = self.txtmlp(context)
 
         combined = torch.cat((img, context), dim=1)  # image first, then text
-
-        # Pad the combined sequence to a multiple of 256 to keep compiled kernel shapes stable.
-        # The pad lands on the text tail; extending txtmask with False makes the shared attention
-        # machinery (cu_seqlens / key-padding mask / trim) exclude it, so it is numerically inert.
-        fulllen = combined.shape[1]
-        padlen = (-fulllen) % 256
-        if padlen > 0:
-            combined = F.pad(combined, (0, 0, 0, padlen))
-            pos = F.pad(pos, (0, 0, 0, padlen))
-            txtmask = F.pad(txtmask, (0, padlen), value=False)
-
-        # Main blocks: bidirectional attention over [image (img_len, all valid) + text (padded)].
-        # Image-first ordering keeps each sample's valid tokens a contiguous prefix, which the
-        # shared varlen path requires.
-        attn_params = AttentionParams.create_attention_params_from_mask(self.attn_mode, self.split_attn, imglen, txtmask)
+        packed_state = None
+        if image_mask is None:
+            # Preserve the original path exactly when token dropping is disabled.
+            fulllen = combined.shape[1]
+            padlen = (-fulllen) % 256
+            if padlen > 0:
+                combined = F.pad(combined, (0, 0, 0, padlen))
+                pos = F.pad(pos, (0, 0, 0, padlen))
+                txtmask = F.pad(txtmask, (0, padlen), value=False)
+            attn_params = AttentionParams.create_attention_params_from_mask(
+                self.attn_mode, self.split_attn, imglen, txtmask
+            )
+        else:
+            if image_mask.shape != (combined.shape[0], imglen):
+                raise ValueError(
+                    f"image_mask must have shape {(combined.shape[0], imglen)}, got {tuple(image_mask.shape)}"
+                )
+            image_mask = image_mask.to(device=combined.device, dtype=torch.bool)
+            combined_mask = torch.cat((image_mask, txtmask), dim=1)
+            combined, pos, combined_mask, permutation, original_length = pack_valid_prefix(
+                combined, pos, combined_mask
+            )
+            packed_state = (combined_mask, permutation, original_length)
+            # The packed sequence has no uniform image prefix across the batch.
+            attn_params = AttentionParams.create_attention_params_from_mask(
+                self.attn_mode, self.split_attn, 0, combined_mask
+            )
 
         freqs = self.posemb(pos)
 
@@ -447,6 +526,11 @@ class SingleStreamDiT(nn.Module):
                 self.offloader.submit_move_blocks_forward(self.blocks, index)
 
         final = self.last(combined, t)
-        output = final[:, :imglen, :]  # image tokens are the leading slice now
+        if packed_state is None:
+            output = final[:, :imglen, :]  # image tokens are the leading slice now
+        else:
+            combined_mask, permutation, original_length = packed_state
+            final = unpack_packed_sequence(final, combined_mask, permutation, original_length)
+            output = final[:, :imglen, :] * image_mask[:, :, None].to(final.dtype)
 
         return output

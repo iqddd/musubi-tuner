@@ -33,12 +33,80 @@ from musubi_tuner.hv_train_network import (
 from musubi_tuner.krea2 import krea2_utils
 from musubi_tuner.krea2 import krea2_sampling
 from musubi_tuner.qwen_image import qwen_image_utils
-from musubi_tuner.utils import model_utils
+from musubi_tuner.utils import model_utils, train_utils
 
 import logging
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+
+def align_alpha_mask_to_token_grid(
+    alpha_mask: torch.Tensor,
+    latent_size: tuple[int, int],
+    patch: int,
+) -> torch.Tensor:
+    """Exclude whole image-token cells touching exact-zero alpha, with no margin.
+
+    Inspect the pixel mask before area downsampling: a single transparent pixel
+    can otherwise disappear into a positive latent-cell average. Qwen's VAE has
+    spatial stride 8, so a patch-2 DiT token covers a 16x16 pixel cell. Positive
+    alpha outside the touched cells is preserved, including soft loss weights.
+    This returns a new mask without modifying the cached input tensor.
+    """
+    if alpha_mask.ndim == 4 and alpha_mask.shape[1] == 1:
+        return align_alpha_mask_to_token_grid(alpha_mask[:, 0], latent_size, patch).unsqueeze(1)
+    if alpha_mask.ndim != 3:
+        raise ValueError(f"Krea2 alpha token drop expects alpha_mask BxHxW, got {tuple(alpha_mask.shape)}")
+    if patch <= 0 or any(size <= 0 or size % patch != 0 for size in latent_size):
+        raise ValueError(f"latent size {latent_size} must be divisible by positive DiT patch size {patch}")
+    expected_size = (latent_size[0] * 8, latent_size[1] * 8)
+    if alpha_mask.shape[-2:] != expected_size:
+        raise ValueError(f"Krea2 alpha mask must have image size {expected_size}, got {tuple(alpha_mask.shape[-2:])}")
+
+    batch_size, height, width = alpha_mask.shape
+    cell = patch * 8
+    zero = (alpha_mask == 0).reshape(batch_size, height // cell, cell, width // cell, cell)
+    touched = zero.any(dim=(2, 4))
+    excluded = touched.repeat_interleave(cell, dim=1).repeat_interleave(cell, dim=2)
+    return alpha_mask.masked_fill(excluded, 0)
+
+
+def make_alpha_token_keep_mask(
+    alpha_mask: torch.Tensor,
+    latent_size: tuple[int, int],
+    patch: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build a token keep-mask from a pre-aligned alpha loss mask.
+
+    Positive alpha values remain valid regardless of magnitude. Exact-zero
+    regions must already cover complete ``patch x patch`` latent cells; silently
+    expanding an unaligned mask would change the requested loss semantics.
+    """
+    if alpha_mask.ndim == 4 and alpha_mask.shape[1] == 1:
+        alpha_mask = alpha_mask[:, 0]
+    if alpha_mask.ndim != 3:
+        raise ValueError(f"Krea2 alpha token drop expects alpha_mask BxHxW, got {tuple(alpha_mask.shape)}")
+    if latent_size[0] % patch != 0 or latent_size[1] % patch != 0:
+        raise ValueError(f"latent size {latent_size} must be divisible by DiT patch size {patch}")
+
+    alpha_mask = alpha_mask.to(device=device, dtype=torch.float32)
+    latent_weights = train_utils.resize_spatial_mask(alpha_mask, latent_size)
+    zero = latent_weights == 0
+    b, h, w = zero.shape
+    blocks = zero.reshape(b, h // patch, patch, w // patch, patch).permute(0, 1, 3, 2, 4)
+    any_zero = blocks.any(dim=(-1, -2))
+    all_zero = blocks.all(dim=(-1, -2))
+    mixed = any_zero & ~all_zero
+    if torch.any(mixed):
+        count = int(mixed.sum().item())
+        raise ValueError(
+            f"--alpha_masked_token_drop requires a loss mask aligned to complete "
+            f"{patch}x{patch} latent / {patch * 8}x{patch * 8} image token cells; "
+            f"found {count} token cells containing both exact-zero and positive weights"
+        )
+    return ~all_zero.flatten(1)
 
 
 class Krea2NetworkTrainer(NetworkTrainer):
@@ -544,12 +612,30 @@ class Krea2NetworkTrainer(NetworkTrainer):
         img_tokens = img_tokens.to(device=device, dtype=network_dtype)
         t = (timesteps / 1000.0).to(device=device)
 
+        image_mask = None
+        if args.alpha_masked_token_drop and batch.get("alpha_mask") is not None:
+            # compute_loss consumes this same batch after call_dit. Align both
+            # loss and token-drop masks together; never expand just attention.
+            batch["alpha_mask"] = align_alpha_mask_to_token_grid(
+                batch["alpha_mask"].to(device=device, dtype=torch.float32), (lat_h, lat_w), patch
+            )
+            image_mask = make_alpha_token_keep_mask(
+                batch["alpha_mask"], (lat_h, lat_w), patch, device
+            )
+
         if args.gradient_checkpointing:
             img_tokens.requires_grad_(True)
             context.requires_grad_(True)
 
         with accelerator.autocast():
-            model_pred = model(img=img_tokens, context=context, t=t, pos=pos, mask=mask)  # (B, h*w, c*ph*pw)
+            model_pred = model(
+                img=img_tokens,
+                context=context,
+                t=t,
+                pos=pos,
+                mask=mask,
+                image_mask=image_mask,
+            )  # (B, h*w, c*ph*pw)
 
         # unpatchify to latent space (B, C, 1, H, W)
         model_pred = rearrange(model_pred, "b (h w) (c ph pw) -> b c (h ph) (w pw)", ph=patch, pw=patch, h=h_, w=w_)
@@ -564,6 +650,13 @@ class Krea2NetworkTrainer(NetworkTrainer):
 
 
 def krea2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    parser.add_argument(
+        "--alpha_masked_token_drop",
+        action="store_true",
+        help="Align exact-zero alpha regions outward to complete 16x16 image-token cells, "
+        "with no extra margin, and exclude those cells from both loss and image attention. "
+        "Positive alpha outside the excluded cells keeps its original soft loss weight.",
+    )
     parser.add_argument(
         "--fp8_scaled",
         action="store_true",
