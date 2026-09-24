@@ -815,6 +815,7 @@ def read_config_from_file(args: argparse.Namespace, parser: argparse.ArgumentPar
             ignore_nesting_dict[key] = value
 
     config_args = argparse.Namespace(**ignore_nesting_dict)
+    config_args.config_file = args.config_file
     args = parser.parse_args(namespace=config_args)
     args.config_file = os.path.splitext(args.config_file)[0]
     logger.info(args.config_file)

@@ -13,6 +13,7 @@ blocks (--compile).
 import argparse
 import gc
 import itertools
+import random
 from typing import Optional
 
 import torch
@@ -22,6 +23,7 @@ from tqdm import tqdm
 from einops import rearrange, repeat
 
 from musubi_tuner.dataset.architectures import ARCHITECTURE_KREA2, ARCHITECTURE_KREA2_FULL
+from musubi_tuner.dataset.image_video_dataset import ImageDataset
 from musubi_tuner.hv_train_network import (
     DiTOutput,
     NetworkTrainer,
@@ -32,6 +34,9 @@ from musubi_tuner.hv_train_network import (
 )
 from musubi_tuner.krea2 import krea2_utils
 from musubi_tuner.krea2 import krea2_sampling
+from musubi_tuner.krea2.alpha_token_mask import align_alpha_mask_to_token_grid, make_alpha_token_keep_mask
+from musubi_tuner.krea2.mixed_token_batch import process_mixed_token_batch
+from musubi_tuner.krea2.token_bucketing import Krea2TokenBucketBatchManager
 from musubi_tuner.qwen_image import qwen_image_utils
 from musubi_tuner.utils import model_utils, train_utils
 
@@ -39,74 +44,6 @@ import logging
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
-
-
-def align_alpha_mask_to_token_grid(
-    alpha_mask: torch.Tensor,
-    latent_size: tuple[int, int],
-    patch: int,
-) -> torch.Tensor:
-    """Exclude whole image-token cells touching exact-zero alpha, with no margin.
-
-    Inspect the pixel mask before area downsampling: a single transparent pixel
-    can otherwise disappear into a positive latent-cell average. Qwen's VAE has
-    spatial stride 8, so a patch-2 DiT token covers a 16x16 pixel cell. Positive
-    alpha outside the touched cells is preserved, including soft loss weights.
-    This returns a new mask without modifying the cached input tensor.
-    """
-    if alpha_mask.ndim == 4 and alpha_mask.shape[1] == 1:
-        return align_alpha_mask_to_token_grid(alpha_mask[:, 0], latent_size, patch).unsqueeze(1)
-    if alpha_mask.ndim != 3:
-        raise ValueError(f"Krea2 alpha token drop expects alpha_mask BxHxW, got {tuple(alpha_mask.shape)}")
-    if patch <= 0 or any(size <= 0 or size % patch != 0 for size in latent_size):
-        raise ValueError(f"latent size {latent_size} must be divisible by positive DiT patch size {patch}")
-    expected_size = (latent_size[0] * 8, latent_size[1] * 8)
-    if alpha_mask.shape[-2:] != expected_size:
-        raise ValueError(f"Krea2 alpha mask must have image size {expected_size}, got {tuple(alpha_mask.shape[-2:])}")
-
-    batch_size, height, width = alpha_mask.shape
-    cell = patch * 8
-    zero = (alpha_mask == 0).reshape(batch_size, height // cell, cell, width // cell, cell)
-    touched = zero.any(dim=(2, 4))
-    excluded = touched.repeat_interleave(cell, dim=1).repeat_interleave(cell, dim=2)
-    return alpha_mask.masked_fill(excluded, 0)
-
-
-def make_alpha_token_keep_mask(
-    alpha_mask: torch.Tensor,
-    latent_size: tuple[int, int],
-    patch: int,
-    device: torch.device,
-) -> torch.Tensor:
-    """Build a token keep-mask from a pre-aligned alpha loss mask.
-
-    Positive alpha values remain valid regardless of magnitude. Exact-zero
-    regions must already cover complete ``patch x patch`` latent cells; silently
-    expanding an unaligned mask would change the requested loss semantics.
-    """
-    if alpha_mask.ndim == 4 and alpha_mask.shape[1] == 1:
-        alpha_mask = alpha_mask[:, 0]
-    if alpha_mask.ndim != 3:
-        raise ValueError(f"Krea2 alpha token drop expects alpha_mask BxHxW, got {tuple(alpha_mask.shape)}")
-    if latent_size[0] % patch != 0 or latent_size[1] % patch != 0:
-        raise ValueError(f"latent size {latent_size} must be divisible by DiT patch size {patch}")
-
-    alpha_mask = alpha_mask.to(device=device, dtype=torch.float32)
-    latent_weights = train_utils.resize_spatial_mask(alpha_mask, latent_size)
-    zero = latent_weights == 0
-    b, h, w = zero.shape
-    blocks = zero.reshape(b, h // patch, patch, w // patch, patch).permute(0, 1, 3, 2, 4)
-    any_zero = blocks.any(dim=(-1, -2))
-    all_zero = blocks.all(dim=(-1, -2))
-    mixed = any_zero & ~all_zero
-    if torch.any(mixed):
-        count = int(mixed.sum().item())
-        raise ValueError(
-            f"--alpha_masked_token_drop requires a loss mask aligned to complete "
-            f"{patch}x{patch} latent / {patch * 8}x{patch * 8} image token cells; "
-            f"found {count} token cells containing both exact-zero and positive weights"
-        )
-    return ~all_zero.flatten(1)
 
 
 class Krea2NetworkTrainer(NetworkTrainer):
@@ -121,6 +58,46 @@ class Krea2NetworkTrainer(NetworkTrainer):
         self._turbo_stash = None
         self._raw_stash = None
         self._h2d_turbo_bank_registered = False
+
+    def _build_dataset(self, args):
+        group, collator, epoch = super()._build_dataset(args)
+        if args.image_token_bucketing:
+            for dataset in group.datasets:
+                if not isinstance(dataset, ImageDataset) or dataset.architecture != ARCHITECTURE_KREA2:
+                    raise ValueError("--image_token_bucketing supports Krea2 image datasets only")
+                old = dataset.batch_manager
+                dataset.batch_manager = Krea2TokenBucketBatchManager(
+                    old.buckets, dataset.batch_size,
+                    multiple=args.image_token_bucket_multiple,
+                    drop_alpha_tokens=args.alpha_masked_token_drop,
+                    num_timestep_buckets=args.num_timestep_buckets,
+                    caption_selection_seed=dataset.seed,
+                    caption_dropout_rate=dataset.caption_dropout_rate,
+                    loss_multiplier=dataset.loss_multiplier,
+                    dry=args.dry_bucketing,
+                )
+            # ConcatDataset cached lengths while the old resolution managers
+            # were installed. Token buckets can have fewer, full batches.
+            group.cumulative_sizes = group.cumsum(group.datasets)
+        return group, collator, epoch
+
+    def prepare_latents_and_noise(self, batch):
+        if isinstance(batch["latents"], list):
+            latents = [self.scale_shift_latents(x) for x in batch["latents"]]
+            return latents, [torch.randn_like(x) for x in latents]
+        return super().prepare_latents_and_noise(batch)
+
+    def process_batch(self, args, accelerator, transformer, network, batch, latents, noise,
+                      noise_scheduler, dit_dtype, network_dtype, vae, global_step):
+        if isinstance(latents, list):
+            return process_mixed_token_batch(
+                self, args, accelerator, transformer, batch, latents, noise,
+                noise_scheduler, dit_dtype, network_dtype
+            )
+        return super().process_batch(
+            args, accelerator, transformer, network, batch, latents, noise,
+            noise_scheduler, dit_dtype, network_dtype, vae, global_step
+        )
 
     # region model specific
 
@@ -650,6 +627,12 @@ class Krea2NetworkTrainer(NetworkTrainer):
 
 
 def krea2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    parser.add_argument("--image_token_bucketing", action="store_true",
+                        help="Group Krea2 microbatches by surviving image-token count across resolutions")
+    parser.add_argument("--image_token_bucket_multiple", type=int, default=1,
+                        help="Token bucket width in multiples of 256 (default: 1)")
+    parser.add_argument("--dry-bucketing", "--dry_bucketing", dest="dry_bucketing", action="store_true",
+                        help="Print Krea2 token-bucket batches using caches, then exit before model loading")
     parser.add_argument(
         "--alpha_masked_token_drop",
         action="store_true",
@@ -702,6 +685,19 @@ def main():
         args.vae_dtype = "bfloat16"
 
     trainer = Krea2NetworkTrainer()
+    if args.dry_bucketing:
+        args.image_token_bucketing = True
+        if args.seed is None:
+            args.seed = random.SystemRandom().randint(0, 2**32 - 1)
+        random.seed(args.seed)
+        group, _, _ = trainer._build_dataset(args)
+        for index, dataset in enumerate(group.datasets):
+            manager = dataset.batch_manager
+            manager.set_current_epoch(1)
+            manager.shuffle(raise_on_remainder=False)
+            manager.report(str(index), dataset.seed)
+            manager.assert_full_batches()
+        return
     trainer.train(args)
 
 

@@ -160,6 +160,29 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 src/mus
 
 </details>
 
+### Image-token bucketing
+
+`--image_token_bucketing` groups Krea 2 images by the number of image tokens retained for DiT, even when their original resolutions differ. The width of each length group is `256 * --image_token_bucket_multiple` tokens (default multiplier: 1). Short group remainders move to the next smaller group. Every image is used once per epoch; if the dataset item count (including repeats) is not divisible by its microbatch size, training stops with an assertion instead of creating a partial microbatch. Each dataset is grouped separately.
+
+With `--alpha_masked_token_drop`, keep counts use the same 16×16 alpha alignment as training. Without it, all image tokens count. Caption length is not included in the grouping. The original image geometry still determines resize/crop, RoPE positions, resolution-aware timesteps, and the full-size denominator of each image's loss.
+
+Preview the grouping without loading model weights or starting training:
+
+```bash
+python src/musubi_tuner/krea2_train_network.py \
+  --dataset_config /workspace/dataset.toml \
+  --alpha_masked_token_drop --dry-bucketing
+```
+
+`--dry-bucketing` implies `--image_token_bucketing` and prints the image-only padding estimate. Run training with `--image_token_bucketing` instead of `--dry-bucketing`. These options also work in a TOML training config.
+
+<details>
+<summary>日本語</summary>
+
+`--image_token_bucketing` は、元の解像度が異なっても、DiTに残る画像トークン数でKrea 2のマイクロバッチを組みます。区間幅は `256 * --image_token_bucket_multiple`（デフォルト倍率1）です。端数は次の小さい区間に移し、各画像を1エポックに1回使います。データセットの項目数（繰り返しを含む）がバッチサイズで割り切れない場合はエラーになります。`--alpha_masked_token_drop` を指定すると16×16に整列したalphaから残存トークン数を計算します。`--dry-bucketing` は重みを読み込まずにバッチ構成と画像トークンのpaddingを表示します。
+
+</details>
+
 ### LoRA target layers / LoRAの対象レイヤー
 
 By default, the Krea 2 LoRA targets **all Linear layers** in the DiT (264 layers: attention, MLP, the text-fusion transformer, and the projection MLPs). This matches the model authors' recommended default configuration (rank/alpha 32). The modulation and RMSNorm parameters are raw tensors (not Linear modules), so they are never wrapped — no exclusion is needed.

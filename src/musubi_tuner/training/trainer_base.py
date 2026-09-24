@@ -1246,6 +1246,11 @@ class NetworkTrainer:
         output = self.call_dit(args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype)
         return self.compute_loss(args, output, timesteps, noise_scheduler, dit_dtype, network_dtype, global_step, batch)
 
+    def prepare_latents_and_noise(self, batch: dict):
+        """Prepare a training microbatch; architectures may support ragged latents."""
+        latents = self.scale_shift_latents(batch["latents"])
+        return latents, torch.randn_like(latents)
+
     @staticmethod
     def apply_dataset_loss_multiplier(loss: torch.Tensor, batch: dict[str, Any]) -> torch.Tensor:
         """Scale the complete per-batch loss by its dataset-level multiplier."""
@@ -2143,16 +2148,12 @@ class NetworkTrainer:
             for step, batch in enumerate(train_dataloader):
                 # torch.compiler.cudagraph_mark_step_begin() # for cudagraphs
 
-                latents = batch["latents"]
                 rescale_update_logs = {}
 
                 with accelerator.accumulate(training_model):
                     accelerator.unwrap_model(network).on_step_start()
 
-                    latents = self.scale_shift_latents(latents)
-
-                    # Sample noise that we'll add to the latents
-                    noise = torch.randn_like(latents)
+                    latents, noise = self.prepare_latents_and_noise(batch)
 
                     loss, loss_metrics = self.process_batch(
                         args,

@@ -620,6 +620,7 @@ class ImageDataset(BaseDataset):
     def shuffle_buckets(self):
         # set random seed for this epoch
         random.seed(self.seed + self.current_epoch)
+        self.batch_manager.set_current_epoch(self.current_epoch)
         self.batch_manager.shuffle()
 
     def __len__(self):
