@@ -22,6 +22,7 @@ import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
 from einops import rearrange, repeat
+from safetensors.torch import load_file
 from tqdm import tqdm
 
 from musubi_tuner.dataset.architectures import ARCHITECTURE_KREA2, ARCHITECTURE_KREA2_FULL
@@ -89,6 +90,10 @@ class Krea2NetworkTrainer(NetworkTrainer):
         self._turbo_stash = None
         self._raw_stash = None
         self._h2d_turbo_bank_registered = False
+        # Base adapters are merged into both RAW and Turbo before optional fp8 quantization.
+        # Keep only the adapter state dicts here; no additional full DiT copy is created.
+        self._base_weights_for_merge = None
+        self._base_weights_multipliers = None
 
     def _build_dataset(self, args):
         group, collator, epoch = super()._build_dataset(args)
@@ -362,6 +367,20 @@ class Krea2NetworkTrainer(NetworkTrainer):
 
     # region RAW-train / Turbo-sample (base-weight swap)
 
+    def _load_base_weights_for_merge(self, args: argparse.Namespace):
+        if args.base_weights is None or len(args.base_weights) == 0:
+            return None, None
+
+        weights_list = []
+        for weight_path in args.base_weights:
+            logger.info(f"Loading Krea 2 base network weights for pre-quantization merge: {weight_path}")
+            weights_sd = load_file(weight_path)
+            weights_list.append(self.convert_weight_keys(weights_sd, args.network_module))
+
+        multipliers = list(args.base_weights_multiplier or [])[: len(weights_list)]
+        multipliers.extend([1.0] * (len(weights_list) - len(multipliers)))
+        return weights_list, multipliers
+
     @staticmethod
     def _named_live_tensors(model):
         """Map checkpoint-style key -> live parameter/buffer tensor of the (unwrapped) DiT.
@@ -453,8 +472,17 @@ class Krea2NetworkTrainer(NetworkTrainer):
             if self._turbo_stash is None:
                 logger.info(f"Krea 2: caching Turbo weights for sampling (M1) from {args.turbo_dit}")
                 self._turbo_stash = krea2_utils.load_krea2_dit_state_dict(
-                    args.turbo_dit, fp8_scaled=args.fp8_scaled, calc_device=accelerator.device, result_device="cpu"
+                    args.turbo_dit,
+                    fp8_scaled=args.fp8_scaled,
+                    calc_device=accelerator.device,
+                    result_device="cpu",
+                    lora_weights=self._base_weights_for_merge,
+                    lora_multipliers=self._base_weights_multipliers,
                 )
+                # M1 never reloads either base checkpoint after the Turbo stash exists; release
+                # the adapter tensors instead of carrying their CPU allocation through training.
+                self._base_weights_for_merge = None
+                self._base_weights_multipliers = None
             h2d_offloader = self._h2d_bank_offloader(model)
             if h2d_offloader is None:
                 if self._raw_stash is None:
@@ -489,7 +517,12 @@ class Krea2NetworkTrainer(NetworkTrainer):
             self._free_base_weights(model)
             clean_memory_on_device(accelerator.device)
             turbo_sd = krea2_utils.load_krea2_dit_state_dict(
-                args.turbo_dit, fp8_scaled=args.fp8_scaled, calc_device=accelerator.device, result_device=accelerator.device
+                args.turbo_dit,
+                fp8_scaled=args.fp8_scaled,
+                calc_device=accelerator.device,
+                result_device=accelerator.device,
+                lora_weights=self._base_weights_for_merge,
+                lora_multipliers=self._base_weights_multipliers,
             )
             self._assign_weights(model, turbo_sd)
             del turbo_sd
@@ -521,7 +554,12 @@ class Krea2NetworkTrainer(NetworkTrainer):
             self._free_base_weights(model)
             clean_memory_on_device(accelerator.device)
             raw_sd = krea2_utils.load_krea2_dit_state_dict(
-                args.dit, fp8_scaled=args.fp8_scaled, calc_device=accelerator.device, result_device=accelerator.device
+                args.dit,
+                fp8_scaled=args.fp8_scaled,
+                calc_device=accelerator.device,
+                result_device=accelerator.device,
+                lora_weights=self._base_weights_for_merge,
+                lora_multipliers=self._base_weights_multipliers,
             )
             self._assign_weights(model, raw_sd)
             del raw_sd
@@ -550,6 +588,7 @@ class Krea2NetworkTrainer(NetworkTrainer):
         # For fp8_scaled, dit_weight_dtype is None (the base trainer skips the post-load cast);
         # the fp8 path ignores dtype and keeps non-target weights in their checkpoint dtype.
         dtype = dit_weight_dtype if dit_weight_dtype is not None else torch.bfloat16
+        self._base_weights_for_merge, self._base_weights_multipliers = self._load_base_weights_for_merge(args)
         model = krea2_utils.load_krea2_dit(
             dit_path,
             device=loading_device,
@@ -558,7 +597,14 @@ class Krea2NetworkTrainer(NetworkTrainer):
             loading_device=loading_device,
             attn_mode=attn_mode,
             split_attn=split_attn,
+            lora_weights=self._base_weights_for_merge,
+            lora_multipliers=self._base_weights_multipliers,
         )
+        if self._base_weights_for_merge is not None:
+            logger.info("Merged base network weights into Krea 2 RAW DiT during model loading")
+            # The shared trainer must not merge the same adapters into the already quantized model.
+            args.base_weights = None
+            args.base_weights_multiplier = None
         return model
 
     def compile_transformer(self, args, transformer):

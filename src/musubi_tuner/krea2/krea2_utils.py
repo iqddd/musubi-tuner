@@ -124,6 +124,8 @@ def load_krea2_dit_state_dict(
     calc_device: Union[str, torch.device] = "cpu",
     result_device: Union[str, torch.device] = "cpu",
     config: SingleMMDiTConfig = single_mmdit_large_wide,
+    lora_weights: Optional[list] = None,
+    lora_multipliers: Optional[list] = None,
 ) -> dict:
     """Produce a Krea 2 DiT state dict matching a model loaded via ``load_krea2_dit``.
 
@@ -135,6 +137,10 @@ def load_krea2_dit_state_dict(
     the live model's ``named_parameters()`` + ``named_buffers()``. The result is moved to
     ``result_device``.
 
+    ``lora_weights`` are merged tensor by tensor before optional fp8 quantization, matching
+    ``load_krea2_dit``. This keeps RAW and Turbo swaps consistent with the initially loaded
+    model without materializing another full-precision DiT.
+
     When ``result_device`` equals ``calc_device`` (e.g. both the GPU, used by the M2 turbo/raw
     swap), the dict is built straight on that device with no full intermediate CPU dict — the
     CPU peak stays at ~1 tensor. When ``result_device`` is CPU (e.g. the M1 resident stash),
@@ -142,21 +148,22 @@ def load_krea2_dit_state_dict(
     """
     calc_dev = torch.device(calc_device)
     rd = torch.device(result_device)
+    has_lora = lora_weights is not None and len(lora_weights) > 0
     # Keep the fp8-quantized tensors on calc_device when that is also the result device, so the
     # dict never round-trips through a full CPU copy (the M2 GPU-direct swap path).
     move_to_device = calc_dev == rd
 
-    if fp8_scaled:
+    if fp8_scaled or has_lora:
         sd = load_safetensors_with_lora_and_fp8(
             model_files=dit_path,
-            lora_weights_list=None,
-            lora_multipliers=None,
-            fp8_optimization=True,
+            lora_weights_list=lora_weights,
+            lora_multipliers=lora_multipliers,
+            fp8_optimization=fp8_scaled,
             calc_device=calc_dev,
             move_to_device=move_to_device,
-            dit_weight_dtype=None,
-            target_keys=KREA2_FP8_OPTIMIZATION_TARGET_KEYS,
-            exclude_keys=KREA2_FP8_OPTIMIZATION_EXCLUDE_KEYS,
+            dit_weight_dtype=None if fp8_scaled else torch.bfloat16,
+            target_keys=KREA2_FP8_OPTIMIZATION_TARGET_KEYS if fp8_scaled else None,
+            exclude_keys=KREA2_FP8_OPTIMIZATION_EXCLUDE_KEYS if fp8_scaled else None,
         )
     else:
         # Load without mmap (disable_mmap=True) to avoid the official load_file's transient ~2x
