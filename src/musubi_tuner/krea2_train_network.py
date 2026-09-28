@@ -13,14 +13,16 @@ blocks (--compile).
 import argparse
 import gc
 import itertools
+import logging
+import math
 import random
 from typing import Optional
 
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
-from tqdm import tqdm
 from einops import rearrange, repeat
+from tqdm import tqdm
 
 from musubi_tuner.dataset.architectures import ARCHITECTURE_KREA2, ARCHITECTURE_KREA2_FULL
 from musubi_tuner.dataset.image_video_dataset import ImageDataset
@@ -29,21 +31,48 @@ from musubi_tuner.hv_train_network import (
     NetworkTrainer,
     clean_memory_on_device,
     load_prompts,
-    setup_parser_common,
     read_config_from_file,
+    setup_parser_common,
 )
-from musubi_tuner.krea2 import krea2_utils
-from musubi_tuner.krea2 import krea2_sampling
-from musubi_tuner.krea2.alpha_token_mask import align_alpha_mask_to_token_grid, make_alpha_token_keep_mask
+from musubi_tuner.krea2 import krea2_sampling, krea2_utils
+from musubi_tuner.krea2.alpha_token_mask import (
+    align_alpha_mask_to_token_grid,
+    make_alpha_token_keep_mask,
+    make_alpha_token_probabilities,
+)
+from musubi_tuner.krea2.log_bias import require_fa2_alpha
 from musubi_tuner.krea2.mixed_token_batch import process_mixed_token_batch
 from musubi_tuner.krea2.token_bucketing import Krea2TokenBucketBatchManager
 from musubi_tuner.qwen_image import qwen_image_utils
-from musubi_tuner.utils import model_utils, train_utils
-
-import logging
+from musubi_tuner.utils import model_utils
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+
+def validate_alpha_masked_attention_args(args: argparse.Namespace) -> None:
+    mode = getattr(args, "alpha_masked_attention_mode", "native")
+    gamma = getattr(args, "alpha_masked_attention_gamma", None)
+    if mode not in ("native", "sharedkv", "logbias"):
+        raise ValueError(f"Unknown Krea2 alpha attention mode: {mode}")
+    if mode != "logbias" and gamma is not None:
+        raise ValueError("--alpha_masked_attention_gamma is valid only with --alpha_masked_attention_mode logbias")
+    if mode == "logbias":
+        if gamma is None:
+            raise ValueError("Krea2 logbias requires an explicit --alpha_masked_attention_gamma")
+        if not math.isfinite(gamma) or gamma <= 0:
+            raise ValueError("Krea2 logbias --alpha_masked_attention_gamma must be finite and positive")
+    if mode == "native":
+        return
+    if not args.alpha_masked_token_drop:
+        raise ValueError(f"Krea2 {mode} requires --alpha_masked_token_drop")
+    # The common loader gives SDPA priority over FA2 if both are set.
+    if not args.flash_attn or args.sdpa:
+        raise ValueError(f"Krea2 {mode} requires FlashAttention 2 (--flash_attn without --sdpa)")
+    if args.split_attn:
+        raise ValueError(f"Krea2 {mode} does not support --split_attn")
+    if mode == "logbias":
+        require_fa2_alpha()
 
 
 class Krea2NetworkTrainer(NetworkTrainer):
@@ -119,6 +148,7 @@ class Krea2NetworkTrainer(NetworkTrainer):
         # whole DiT (incl. norms) to fp8, which breaks. Require --fp8_scaled with --fp8_base.
         if args.fp8_base and not args.fp8_scaled:
             raise ValueError("Krea 2 fp8 supports only scaled fp8: pass --fp8_scaled together with --fp8_base.")
+        validate_alpha_masked_attention_args(args)
         # RAW-train / Turbo-sample: the recommended K2 LoRA workflow is to train on the RAW
         # checkpoint and run inference on the distilled Turbo. --turbo_dit makes sample
         # generation during training swap the base weights to Turbo (LoRA, hooked on the live
@@ -589,7 +619,16 @@ class Krea2NetworkTrainer(NetworkTrainer):
         img_tokens = img_tokens.to(device=device, dtype=network_dtype)
         t = (timesteps / 1000.0).to(device=device)
 
+        alpha_attention_mode = getattr(args, "alpha_masked_attention_mode", "native")
+        if alpha_attention_mode not in ("native", "sharedkv", "logbias"):
+            raise ValueError(f"Unknown Krea2 alpha attention mode: {alpha_attention_mode}")
+        if alpha_attention_mode in ("sharedkv", "logbias") and not args.alpha_masked_token_drop:
+            raise ValueError(f"Krea2 {alpha_attention_mode} requires --alpha_masked_token_drop")
+        uses_alpha_probabilities = alpha_attention_mode in ("sharedkv", "logbias")
+
         image_mask = None
+        image_kv_probabilities = None
+        shared_kv_uniforms = None
         if args.alpha_masked_token_drop and batch.get("alpha_mask") is not None:
             # compute_loss consumes this same batch after call_dit. Align both
             # loss and token-drop masks together; never expand just attention.
@@ -599,20 +638,43 @@ class Krea2NetworkTrainer(NetworkTrainer):
             image_mask = make_alpha_token_keep_mask(
                 batch["alpha_mask"], (lat_h, lat_w), patch, device
             )
+            if uses_alpha_probabilities:
+                image_kv_probabilities = make_alpha_token_probabilities(
+                    batch["alpha_mask"], (lat_h, lat_w), patch, device
+                )
+        elif uses_alpha_probabilities:
+            # Missing alpha is semantically fully opaque. Still use the selected
+            # layout so the selected mode has one stable main-block code path.
+            image_mask = torch.ones((bsize, h_ * w_), device=device, dtype=torch.bool)
+            image_kv_probabilities = torch.ones((bsize, h_ * w_), device=device, dtype=torch.float32)
+
+        if alpha_attention_mode == "sharedkv":
+            shared_kv_uniforms = torch.rand((bsize,), device=device, dtype=torch.float32)
 
         if args.gradient_checkpointing:
             img_tokens.requires_grad_(True)
             context.requires_grad_(True)
 
         with accelerator.autocast():
-            model_pred = model(
-                img=img_tokens,
-                context=context,
-                t=t,
-                pos=pos,
-                mask=mask,
-                image_mask=image_mask,
-            )  # (B, h*w, c*ph*pw)
+            model_kwargs = {
+                "img": img_tokens,
+                "context": context,
+                "t": t,
+                "pos": pos,
+                "mask": mask,
+                "image_mask": image_mask,
+            }
+            if alpha_attention_mode == "sharedkv":
+                model_kwargs.update(
+                    image_kv_probabilities=image_kv_probabilities,
+                    shared_kv_uniforms=shared_kv_uniforms,
+                )
+            elif alpha_attention_mode == "logbias":
+                model_kwargs.update(
+                    image_kv_probabilities=image_kv_probabilities,
+                    log_bias_gamma=getattr(args, "alpha_masked_attention_gamma", None),
+                )
+            model_pred = model(**model_kwargs)  # (B, h*w, c*ph*pw)
 
         # unpatchify to latent space (B, C, 1, H, W)
         model_pred = rearrange(model_pred, "b (h w) (c ph pw) -> b c (h ph) (w pw)", ph=patch, pw=patch, h=h_, w=w_)
@@ -639,6 +701,22 @@ def krea2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
         help="Align exact-zero alpha regions outward to complete 16x16 image-token cells, "
         "with no extra margin, and exclude those cells from both loss and image attention. "
         "Positive alpha outside the excluded cells keeps its original soft loss weight.",
+    )
+    parser.add_argument(
+        "--alpha_masked_attention_mode",
+        type=str,
+        default="native",
+        choices=["native", "sharedkv", "logbias"],
+        help="Krea2 attention treatment for positive-alpha image tokens. native preserves the existing behavior; "
+        "sharedkv retains Q/loss but enables each token's K/V using one shared per-image random threshold. "
+        "logbias adds gamma*log(mean alpha) to each image key's attention logit. The non-native modes require "
+        "--alpha_masked_token_drop and non-split --flash_attn.",
+    )
+    parser.add_argument(
+        "--alpha_masked_attention_gamma",
+        type=float,
+        default=None,
+        help="Required positive finite gamma for --alpha_masked_attention_mode logbias; invalid for other modes.",
     )
     parser.add_argument(
         "--fp8_scaled",
@@ -679,6 +757,7 @@ def main():
 
     args = parser.parse_args()
     args = read_config_from_file(args, parser)
+    validate_alpha_masked_attention_args(args)
 
     args.dit_dtype = "bfloat16"
     if args.vae_dtype is None:

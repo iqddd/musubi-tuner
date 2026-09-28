@@ -54,3 +54,36 @@ def make_alpha_token_keep_mask(
             f"found {count} token cells containing both exact-zero and positive weights"
         )
     return ~all_zero.flatten(1)
+
+
+def make_alpha_token_probabilities(
+    alpha_mask: torch.Tensor, latent_size: tuple[int, int], patch: int, device: torch.device
+) -> torch.Tensor:
+    """Return mean alpha for each DiT image token from a prealigned mask."""
+    if alpha_mask.ndim == 4 and alpha_mask.shape[1] == 1:
+        alpha_mask = alpha_mask[:, 0]
+    if alpha_mask.ndim != 3:
+        raise ValueError(f"Krea2 alpha attention expects alpha_mask BxHxW, got {tuple(alpha_mask.shape)}")
+    if patch <= 0 or any(size <= 0 or size % patch != 0 for size in latent_size):
+        raise ValueError(f"latent size {latent_size} must be divisible by positive DiT patch size {patch}")
+
+    alpha_mask = alpha_mask.to(device=device, dtype=torch.float32)
+    if not torch.isfinite(alpha_mask).all():
+        raise ValueError("Krea2 alpha attention mask contains non-finite values")
+    if torch.any((alpha_mask < 0) | (alpha_mask > 1)):
+        raise ValueError("Krea2 alpha attention mask values must be in [0, 1]")
+    token_size = (latent_size[0] // patch, latent_size[1] // patch)
+    return train_utils.resize_spatial_mask(alpha_mask, token_size).flatten(1)
+
+
+def make_shared_kv_keep_mask(probabilities: torch.Tensor, uniforms: torch.Tensor) -> torch.Tensor:
+    """Apply one shared uniform threshold per image to every image-token alpha."""
+    if probabilities.ndim != 2:
+        raise ValueError(f"shared K/V probabilities must be BxN, got {probabilities.shape}")
+    if uniforms.shape != (probabilities.shape[0],):
+        raise ValueError(f"shared K/V uniforms must have shape {(probabilities.shape[0],)}, got {uniforms.shape}")
+    if not torch.isfinite(probabilities).all() or torch.any((probabilities < 0) | (probabilities > 1)):
+        raise ValueError("shared K/V probabilities must be finite and in [0, 1]")
+    if not torch.isfinite(uniforms).all() or torch.any((uniforms < 0) | (uniforms >= 1)):
+        raise ValueError("shared K/V uniforms must be finite and in [0, 1)")
+    return uniforms[:, None] < probabilities

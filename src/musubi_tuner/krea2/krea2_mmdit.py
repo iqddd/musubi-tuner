@@ -17,7 +17,11 @@ import torch.utils.checkpoint
 from einops import rearrange
 from torch import Tensor
 
-from musubi_tuner.modules.attention import AttentionParams, attention as common_attention
+from musubi_tuner.krea2.alpha_token_mask import make_shared_kv_keep_mask
+from musubi_tuner.krea2.log_bias import LogBiasPlan, log_bias_flash_attention, make_log_bias_plan
+from musubi_tuner.krea2.shared_kv import SharedKVPlan, make_shared_kv_plan, shared_kv_flash_attention
+from musubi_tuner.modules.attention import AttentionParams
+from musubi_tuner.modules.attention import attention as common_attention
 from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig, create_offloader
 
 
@@ -232,7 +236,16 @@ class Attention(torch.nn.Module):
         self.qknorm = QKNorm(self.headdim)
         self.wo = torch.nn.Linear(dim, dim, bias=bias)
 
-    def forward(self, qkv: Tensor, freqs: Tensor | None = None, attn_params: AttentionParams | None = None) -> Tensor:
+    def forward(
+        self,
+        qkv: Tensor,
+        freqs: Tensor | None = None,
+        attn_params: AttentionParams | None = None,
+        shared_kv_plan: SharedKVPlan | None = None,
+        log_bias_plan: LogBiasPlan | None = None,
+    ) -> Tensor:
+        if shared_kv_plan is not None and log_bias_plan is not None:
+            raise ValueError("Krea2 sharedkv and logbias attention plans are mutually exclusive")
         q, k, v, gate = self.wq(qkv), self.wk(qkv), self.wv(qkv), self.gate(qkv)
 
         # QKNorm + RoPE run in [B, H, L, D] (K2-native layout) to preserve the reference numerics.
@@ -249,7 +262,16 @@ class Attention(torch.nn.Module):
         # The shared attention expects [B, L, H, D] and returns [B, L, H*D]. GQA (heads != kvheads)
         # is detected and handled inside it (enable_gqa for SDPA; native for flash/sageattn).
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-        x = common_attention([q, k, v], attn_params=attn_params)
+        if shared_kv_plan is None and log_bias_plan is None:
+            x = common_attention([q, k, v], attn_params=attn_params)
+        elif shared_kv_plan is not None:
+            if attn_params is None or attn_params.attn_mode != "flash" or attn_params.split_attn:
+                raise ValueError("Krea2 sharedkv requires non-split FlashAttention 2")
+            x = shared_kv_flash_attention(q, k, v, shared_kv_plan).reshape(q.shape[0], q.shape[1], -1)
+        else:
+            if attn_params is None or attn_params.attn_mode != "flash" or attn_params.split_attn:
+                raise ValueError("Krea2 logbias requires non-split FlashAttention 2")
+            x = log_bias_flash_attention(q, k, v, log_bias_plan).reshape(q.shape[0], q.shape[1], -1)
         out = self.wo(x * F.sigmoid(gate))
 
         return out
@@ -345,9 +367,23 @@ class SingleStreamBlock(nn.Module):
         self.attn = Attention(dim=features, heads=heads, bias=bias, kvheads=kvheads)
         self.mlp = SwiGLU(features, multiplier, bias)
 
-    def forward(self, x: Tensor, vec: Tensor, freqs: Tensor, attn_params: AttentionParams | None = None) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        vec: Tensor,
+        freqs: Tensor,
+        attn_params: AttentionParams | None = None,
+        shared_kv_plan: SharedKVPlan | None = None,
+        log_bias_plan: LogBiasPlan | None = None,
+    ) -> Tensor:
         prescale, preshift, pregate, postscale, postshift, postgate = self.mod(vec)
-        x = x + pregate * self.attn((1 + prescale) * self.prenorm(x) + preshift, freqs, attn_params)
+        x = x + pregate * self.attn(
+            (1 + prescale) * self.prenorm(x) + preshift,
+            freqs,
+            attn_params,
+            shared_kv_plan,
+            log_bias_plan,
+        )
         x = x + postgate * self.mlp((1 + postscale) * self.postnorm(x) + postshift)
 
         return x
@@ -465,6 +501,9 @@ class SingleStreamDiT(nn.Module):
         pos: Tensor,
         mask: Tensor | None = None,
         image_mask: Tensor | None = None,
+        image_kv_probabilities: Tensor | None = None,
+        shared_kv_uniforms: Tensor | None = None,
+        log_bias_gamma: float | None = None,
     ) -> Tensor:
         img = self.first(img)
         t = self.tmlp(temb(t, self.config.tdim, device=img.device, dtype=img.dtype))
@@ -483,7 +522,22 @@ class SingleStreamDiT(nn.Module):
         context = self.txtmlp(context)
 
         combined = torch.cat((img, context), dim=1)  # image first, then text
+        has_probabilities = image_kv_probabilities is not None
+        has_sharedkv = shared_kv_uniforms is not None
+        has_logbias = log_bias_gamma is not None
+        if has_sharedkv and has_logbias:
+            raise ValueError("Krea2 sharedkv and logbias inputs are mutually exclusive")
+        if has_probabilities != (has_sharedkv or has_logbias):
+            raise ValueError(
+                "image_kv_probabilities must be provided with exactly one of "
+                "shared_kv_uniforms or log_bias_gamma"
+            )
+        if image_kv_probabilities is not None and image_mask is None:
+            raise ValueError("Krea2 alpha-aware attention requires image_mask so exact-zero alpha is physically dropped")
+
         packed_state = None
+        shared_kv_plan = None
+        log_bias_plan = None
         if image_mask is None:
             # Preserve the original path exactly when token dropping is disabled.
             fulllen = combined.shape[1]
@@ -502,6 +556,19 @@ class SingleStreamDiT(nn.Module):
                 )
             image_mask = image_mask.to(device=combined.device, dtype=torch.bool)
             combined_mask = torch.cat((image_mask, txtmask), dim=1)
+            combined_probabilities = None
+            if image_kv_probabilities is not None:
+                if image_kv_probabilities.shape != image_mask.shape:
+                    raise ValueError(
+                        f"image_kv_probabilities must have shape {tuple(image_mask.shape)}, "
+                        f"got {tuple(image_kv_probabilities.shape)}"
+                    )
+                image_kv_probabilities = image_kv_probabilities.to(device=combined.device, dtype=torch.float32)
+                if shared_kv_uniforms is not None:
+                    shared_kv_uniforms = shared_kv_uniforms.to(device=combined.device, dtype=torch.float32)
+                combined_probabilities = torch.cat(
+                    (image_kv_probabilities, torch.ones_like(txtmask, dtype=torch.float32)), dim=1
+                )
             combined, pos, combined_mask, permutation, original_length = pack_valid_prefix(
                 combined, pos, combined_mask
             )
@@ -510,6 +577,19 @@ class SingleStreamDiT(nn.Module):
             attn_params = AttentionParams.create_attention_params_from_mask(
                 self.attn_mode, self.split_attn, 0, combined_mask
             )
+            if combined_probabilities is not None:
+                gathered_length = min(original_length, combined.shape[1])
+                gather_indices = permutation[:, :gathered_length]
+                packed_probabilities = torch.gather(combined_probabilities, 1, gather_indices)
+                if combined.shape[1] > gathered_length:
+                    packed_probabilities = F.pad(
+                        packed_probabilities, (0, combined.shape[1] - gathered_length), value=0
+                    )
+                if shared_kv_uniforms is not None:
+                    keep_kv = make_shared_kv_keep_mask(packed_probabilities, shared_kv_uniforms) & combined_mask
+                    shared_kv_plan = make_shared_kv_plan(combined_mask, keep_kv)
+                else:
+                    log_bias_plan = make_log_bias_plan(combined_mask, packed_probabilities, log_bias_gamma)
 
         freqs = self.posemb(pos)
 
@@ -518,9 +598,18 @@ class SingleStreamDiT(nn.Module):
                 self.offloader.wait_for_block(index)
 
             if self.gradient_checkpointing and self.training:
-                combined = torch.utils.checkpoint.checkpoint(block, combined, tvec, freqs, attn_params, use_reentrant=False)
+                combined = torch.utils.checkpoint.checkpoint(
+                    block,
+                    combined,
+                    tvec,
+                    freqs,
+                    attn_params,
+                    shared_kv_plan,
+                    log_bias_plan,
+                    use_reentrant=False,
+                )
             else:
-                combined = block(combined, tvec, freqs, attn_params)
+                combined = block(combined, tvec, freqs, attn_params, shared_kv_plan, log_bias_plan)
 
             if self.blocks_to_swap:
                 self.offloader.submit_move_blocks_forward(self.blocks, index)

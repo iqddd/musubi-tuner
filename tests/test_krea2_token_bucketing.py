@@ -189,3 +189,40 @@ def test_uniform_geometry_matches_existing_krea2_loss():
         None, torch.float32, torch.float32
     )
     torch.testing.assert_close(new_loss, old_loss, rtol=2e-5, atol=2e-5)
+
+
+def test_mixed_geometry_sharedkv_packs_selected_probabilities():
+    class Model:
+        config = SimpleNamespace(patch=2)
+
+        def __call__(self, **kwargs):
+            self.kwargs = kwargs
+            return torch.zeros_like(kwargs["img"])
+
+    model = Model()
+    trainer = Krea2NetworkTrainer()
+    accelerator = SimpleNamespace(device=torch.device("cpu"), autocast=nullcontext)
+    args = SimpleNamespace(
+        alpha_masked_token_drop=True, alpha_masked_attention_mode="sharedkv",
+        gradient_checkpointing=False, weighting_scheme="none", timestep_sampling="uniform",
+        sigmoid_scale=1.0, min_timestep=None, max_timestep=None, preserve_distribution_shape=False,
+    )
+    latents = [torch.zeros(2, 1, 4, 4), torch.zeros(2, 1, 4, 6)]
+    noise = [torch.ones_like(latent) for latent in latents]
+    alpha = torch.ones(32, 32)
+    alpha[:16, :16] = 0
+    alpha[:16, 16:] = 0.25
+    batch = {
+        "alpha_mask": [alpha, None],
+        "krea2_vl_embed": [torch.zeros(3, 2, 32), torch.zeros(2, 2, 32)],
+        "timesteps": [0.3, 0.6],
+    }
+    loss, _ = process_mixed_token_batch(
+        trainer, args, accelerator, model, batch, latents, noise,
+        None, torch.float32, torch.float32,
+    )
+    assert torch.isfinite(loss)
+    assert model.kwargs["image_mask"].sum(dim=1).tolist() == [3, 6]
+    assert model.kwargs["image_kv_probabilities"][0, :3].tolist() == [0.25, 1.0, 1.0]
+    assert torch.all(model.kwargs["image_kv_probabilities"][1, :6] == 1)
+    assert model.kwargs["shared_kv_uniforms"].shape == (2,)

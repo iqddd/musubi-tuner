@@ -160,11 +160,67 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 src/mus
 
 </details>
 
+### Alpha-masked attention
+
+`--alpha_masked_token_drop` aligns exact-zero alpha outward to complete 16×16
+image-token cells. Those cells are removed from DiT attention and receive zero
+loss; positive alpha keeps its original soft MSE weight. The default
+`--alpha_masked_attention_mode native` preserves the existing behavior: every
+positive-alpha token participates fully in attention.
+
+For probabilistic source suppression, use:
+
+```bash
+--flash_attn --alpha_masked_token_drop --alpha_masked_attention_mode sharedkv
+```
+
+`sharedkv` retains the Q, prediction, and soft-weighted loss of every positive
+token, but conditionally removes its K/V. Once per image presentation it draws
+one `u ~ Uniform[0,1)` and retains a token's K/V when
+`u < mean(alpha over its 16x16 cell)`. Thus equal-alpha regions switch together,
+higher-alpha retained sets contain lower-threshold sets, alpha 0 is always
+removed, and alpha 255 is always retained. The same decision is reused by all
+DiT blocks and gradient-checkpoint recomputation. Text K/V is always retained;
+training-time sample generation remains native.
+
+This mode requires FlashAttention 2 and does not support `--split_attn`. It uses
+fixed B×N storage, so the random retained K/V count does not become a tensor-shape
+or token-bucketing coordinate. A missing alpha mask is treated as fully opaque.
+
+For deterministic soft source suppression, use `logbias` and explicitly choose
+its strength:
+
+```bash
+--flash_attn --alpha_masked_token_drop \
+--alpha_masked_attention_mode logbias --alpha_masked_attention_gamma 3
+```
+
+For each retained image token, `logbias` adds
+`gamma * log(mean(alpha over its 16x16 cell))` to that key's attention logit.
+Text keys receive zero bias. Exact-zero cells are still physically removed; a
+positive-alpha token keeps its Q, prediction, and soft-weighted MSE even when its
+outgoing K/V influence is strongly reduced. Missing alpha is equivalent to alpha
+255 and therefore gives zero bias. The same fixed bias is reused by every main
+DiT block and gradient-checkpoint recomputation; text fusion and training-time
+sample generation remain native.
+
+`logbias` requires the optional `fa2-alpha` CUDA extension in addition to the
+normal FlashAttention installation. The currently tested wheel is specialized
+for Linux x86_64, CPython 3.12, PyTorch 2.10.0+cu130, CUDA SM120, BF16,
+head_dim=128, GQA varlen attention, and no attention dropout. Install a wheel
+compatible with the actual Python/PyTorch/CUDA/GPU combination before selecting
+this mode. `native` and `sharedkv` do not depend on `fa2-alpha`.
+
 ### Image-token bucketing
 
 `--image_token_bucketing` groups Krea 2 images by the number of image tokens retained for DiT, even when their original resolutions differ. The width of each length group is `256 * --image_token_bucket_multiple` tokens (default multiplier: 1). Short group remainders move to the next smaller group. Every image is used once per epoch; if the dataset item count (including repeats) is not divisible by its microbatch size, training stops with an assertion instead of creating a partial microbatch. Each dataset is grouped separately.
 
 With `--alpha_masked_token_drop`, keep counts use the same 16×16 alpha alignment as training. Without it, all image tokens count. Caption length is not included in the grouping. The original image geometry still determines resize/crop, RoPE positions, resolution-aware timesteps, and the full-size denominator of each image's loss.
+
+In `sharedkv` and `logbias` modes, bucketing still uses the number of Q tokens
+remaining after exact-zero token drop. The random number of enabled K/V in
+`sharedkv`, and the bias values in `logbias`, do not change batch membership or
+allocated sequence length.
 
 Preview the grouping without loading model weights or starting training:
 

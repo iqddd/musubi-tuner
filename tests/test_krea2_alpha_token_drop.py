@@ -91,10 +91,12 @@ def test_trainer_shares_snap16_mask_between_loss_and_token_drop(enabled, has_alp
     batch = {"latents": latents, "krea2_vl_embed": [torch.zeros(3, 2, 32)]}
     if has_alpha:
         batch["alpha_mask"] = alpha
+    rng_state = torch.get_rng_state().clone()
     output = Krea2NetworkTrainer.call_dit(
         None, args, accelerator, model, latents, batch, torch.ones_like(latents),
         latents, torch.tensor([500.0]), torch.float32,
     )
+    assert torch.equal(torch.get_rng_state(), rng_state)  # default native mode introduces no RNG
     if enabled and has_alpha:
         assert model.image_mask.tolist() == [[False, True, True, True]]
         weights = apply_alpha_masked_loss(torch.ones_like(output.pred), batch)

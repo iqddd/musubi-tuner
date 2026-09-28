@@ -6,7 +6,11 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 
-from musubi_tuner.krea2.alpha_token_mask import align_alpha_mask_to_token_grid, make_alpha_token_keep_mask
+from musubi_tuner.krea2.alpha_token_mask import (
+    align_alpha_mask_to_token_grid,
+    make_alpha_token_keep_mask,
+    make_alpha_token_probabilities,
+)
 from musubi_tuner.training.timesteps import compute_loss_weighting_for_sd3
 from musubi_tuner.utils import train_utils
 
@@ -16,7 +20,15 @@ def process_mixed_token_batch(trainer, args, accelerator, transformer, batch, la
     """Prepare spatial tensors separately, then perform one packed DiT forward."""
     patch = transformer.config.patch
     device = accelerator.device
-    images, positions, image_masks, targets, aligned_alphas, timesteps = [], [], [], [], [], []
+    alpha_attention_mode = getattr(args, "alpha_masked_attention_mode", "native")
+    if alpha_attention_mode not in ("native", "sharedkv", "logbias"):
+        raise ValueError(f"Unknown Krea2 alpha attention mode: {alpha_attention_mode}")
+    if alpha_attention_mode in ("sharedkv", "logbias") and not args.alpha_masked_token_drop:
+        raise ValueError(f"Krea2 {alpha_attention_mode} requires --alpha_masked_token_drop")
+    uses_alpha_probabilities = alpha_attention_mode in ("sharedkv", "logbias")
+
+    images, positions, image_masks, image_probabilities = [], [], [], []
+    targets, aligned_alphas, timesteps = [], [], []
     original_shapes, kept_indices = [], []
     preset_timesteps = batch.get("timesteps")
     for i, (latent, eps) in enumerate(zip(latents, noise)):
@@ -41,14 +53,24 @@ def process_mixed_token_batch(trainer, args, accelerator, transformer, batch, la
             alpha = align_alpha_mask_to_token_grid(alpha[None].to(device=device, dtype=torch.float32),
                                                    (original_h, original_w), patch)
             keep = make_alpha_token_keep_mask(alpha, (original_h, original_w), patch, device)
+            probabilities = (
+                make_alpha_token_probabilities(alpha, (original_h, original_w), patch, device)
+                if uses_alpha_probabilities else None
+            )
         else:
             keep = torch.ones((1, h * w), device=device, dtype=torch.bool)
+            probabilities = (
+                torch.ones((1, h * w), device=device, dtype=torch.float32)
+                if uses_alpha_probabilities else None
+            )
             if alpha is not None:
                 alpha = alpha[None].to(device=device, dtype=torch.float32)
         selected = keep[0].nonzero(as_tuple=True)[0]
         images.append(tokens[0, selected].to(dtype=network_dtype))
         positions.append(pos[0, selected])
         image_masks.append(torch.ones(selected.numel(), device=device, dtype=torch.bool))
+        if uses_alpha_probabilities:
+            image_probabilities.append(probabilities[0, selected])
         kept_indices.append(selected)
         # Match Krea2.call_dit: latents are promoted to the trainable network
         # dtype before forming the velocity target (cached noise may be bf16).
@@ -61,6 +83,11 @@ def process_mixed_token_batch(trainer, args, accelerator, transformer, batch, la
     image = torch.stack([F.pad(tokens, (0, 0, 0, max_image - tokens.shape[0])) for tokens in images])
     image_pos = torch.stack([F.pad(pos, (0, 0, 0, max_image - pos.shape[0])) for pos in positions])
     image_mask = torch.stack([F.pad(mask, (0, max_image - mask.shape[0]), value=False) for mask in image_masks])
+    image_kv_probabilities = None
+    if uses_alpha_probabilities:
+        image_kv_probabilities = torch.stack(
+            [F.pad(probability, (0, max_image - probability.shape[0]), value=0) for probability in image_probabilities]
+        )
 
     embeds = batch["krea2_vl_embed"]
     max_text = max(embed.shape[0] for embed in embeds)
@@ -77,10 +104,25 @@ def process_mixed_token_batch(trainer, args, accelerator, transformer, batch, la
         context.requires_grad_(True)
 
     with accelerator.autocast():
-        predictions = transformer(
-            img=image, context=context, t=torch.stack(timesteps).to(device=device) / 1000.0,
-            pos=pos, mask=mask, image_mask=image_mask
-        )
+        model_kwargs = {
+            "img": image,
+            "context": context,
+            "t": torch.stack(timesteps).to(device=device) / 1000.0,
+            "pos": pos,
+            "mask": mask,
+            "image_mask": image_mask,
+        }
+        if alpha_attention_mode == "sharedkv":
+            model_kwargs.update(
+                image_kv_probabilities=image_kv_probabilities,
+                shared_kv_uniforms=torch.rand((len(images),), device=device, dtype=torch.float32),
+            )
+        elif alpha_attention_mode == "logbias":
+            model_kwargs.update(
+                image_kv_probabilities=image_kv_probabilities,
+                log_bias_gamma=getattr(args, "alpha_masked_attention_gamma", None),
+            )
+        predictions = transformer(**model_kwargs)
 
     losses = []
     for i, ((h, w), selected, target, alpha, timestep) in enumerate(
