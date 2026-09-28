@@ -221,6 +221,18 @@ requires `--alpha_masked_token_drop`, standard `networks.lora_krea2`, and
 `blocks_to_swap=0`. It is off by default. All three attention modes are supported;
 their existing backend and gamma requirements still apply.
 
+Use `--alpha_masked_output_preservation_loss_balance k` to rebalance the two loss
+terms while keeping their coefficients' sum equal to 2:
+
+```text
+loss = (1+k) * loss_target + (1-k) * loss_preservation
+```
+
+The default is `k=0`, which gives both terms their original coefficient of 1.
+`k` must be finite and in the closed interval `[-1, 1]`, keeping both loss
+coefficients non-negative. The `loss_target` and `loss_preservation` metrics
+remain unscaled.
+
 For the same noisy latent, timestep and caption, compute the base-model teacher
 (LoRA off, no gradient) with `1-a`, then the target student with `a` and the
 preservation student with `1-a`:
@@ -232,7 +244,8 @@ loss = mean_full_latent(a * (target_student - flow_target)^2
 
 Here `a = mean(alpha/255)` per 16×16 tile; the inverse is exactly `1-a`.
 There is no area renormalization or extra factor of one half. Both terms use the
-same timestep weighting and dataset multiplier, with no extra scaling between branches.
+same timestep weighting and dataset multiplier; the optional loss balance above
+is the only extra scaling between branches.
 Mixed-resolution losses are averaged per full image first, then across images.
 The metrics `loss_target` and `loss_preservation` report the two terms separately.
 Missing alpha means `a=1`, so no preservation passes are needed. Entire empty

@@ -68,6 +68,11 @@ dev = [
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.pytest.ini_options]
+markers = [
+    "slow: long-running tests excluded from the default suite (enable with --run-slow)",
+]
+
 [tool.uv.sources]
 torch = [
   { index = "pytorch-cu124", extra = "cu124" },

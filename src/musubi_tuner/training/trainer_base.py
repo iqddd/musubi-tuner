@@ -107,6 +107,7 @@ class NetworkTrainer:
         self.num_timestep_buckets: Optional[int] = None  # for get_bucketed_timestep()
         self.vae_frame_stride = 4  # all architectures require frames to be divisible by 4, except Qwen-Image-Layered
         self.default_discrete_flow_shift = 14.5  # default value for discrete flow shift for all models TODO may be None is better
+        self._resume_training_progress: train_utils.TrainingProgress | None = None
 
     def _classify_rescale_group(self, parameter_name: str) -> str:
         if "single_blocks" in parameter_name:
@@ -522,11 +523,18 @@ class NetworkTrainer:
 
     def resume_from_local_or_hf_if_specified(self, accelerator: Accelerator, args: argparse.Namespace) -> bool:
         if not args.resume:
+            self._resume_training_progress = None
             return False
 
         if not args.resume_from_huggingface:
             logger.info(f"resume training from local state: {args.resume}")
+            self._resume_training_progress = train_utils.load_training_progress(args.resume)
             accelerator.load_state(args.resume)
+            logger.info(
+                f"resume training position: global_step={self._resume_training_progress.global_step}, "
+                f"completed_epochs={self._resume_training_progress.completed_epochs}, "
+                f"step_in_epoch={self._resume_training_progress.step_in_epoch}"
+            )
             return True
 
         logger.info(f"resume training from huggingface state: {args.resume}")
@@ -570,7 +578,13 @@ class NetworkTrainer:
                 "No files found in the specified repo id/path/revision / 指定されたリポジトリID/パス/リビジョンにファイルが見つかりませんでした"
             )
         dirname = os.path.dirname(results[0])
+        self._resume_training_progress = train_utils.load_training_progress(dirname)
         accelerator.load_state(dirname)
+        logger.info(
+            f"resume training position: global_step={self._resume_training_progress.global_step}, "
+            f"completed_epochs={self._resume_training_progress.completed_epochs}, "
+            f"step_in_epoch={self._resume_training_progress.step_in_epoch}"
+        )
 
         return True
 
@@ -1932,6 +1946,26 @@ class NetworkTrainer:
         # epoch数を計算する
         num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
         num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+        is_resuming = self._resume_training_progress is not None
+        if is_resuming:
+            training_progress = self._resume_training_progress
+            epoch_to_start, batches_to_skip = training_progress.resolve_resume_position(
+                num_batches_per_epoch=len(train_dataloader),
+                gradient_accumulation_steps=args.gradient_accumulation_steps,
+                max_train_steps=args.max_train_steps,
+            )
+            global_step = training_progress.global_step
+        else:
+            training_progress = train_utils.TrainingProgress(
+                global_step=0,
+                completed_epochs=0,
+                step_in_epoch=0,
+                num_batches_per_epoch=len(train_dataloader),
+                gradient_accumulation_steps=args.gradient_accumulation_steps,
+            )
+            epoch_to_start = 0
+            batches_to_skip = 0
+            global_step = 0
 
         # 学習する
         # total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -2053,11 +2087,14 @@ class NetworkTrainer:
                 init_kwargs=init_kwargs,
             )
 
-        # TODO skip until initial step
-        progress_bar = tqdm(range(args.max_train_steps), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps")
+        progress_bar = tqdm(
+            total=args.max_train_steps,
+            initial=global_step,
+            smoothing=0,
+            disable=not accelerator.is_local_main_process,
+            desc="steps",
+        )
 
-        epoch_to_start = 0
-        global_step = 0
         noise_scheduler = FlowMatchDiscreteScheduler(shift=args.discrete_flow_shift, reverse=True, solver="euler")
 
         loss_recorder = train_utils.LossRecorder()
@@ -2133,13 +2170,13 @@ class NetworkTrainer:
                 )
 
         # For --sample_at_first
-        if should_sample_images(args, global_step, epoch=0):
+        if not is_resuming and should_sample_images(args, global_step, epoch=0):
             optimizer_eval_fn()
             _do_sample(0, global_step)
             optimizer_train_fn()
         if len(accelerator.trackers) > 0:
             # log empty object to commit the sample images to wandb
-            accelerator.log({}, step=0)
+            accelerator.log({}, step=global_step)
 
         # training loop
 
@@ -2163,7 +2200,15 @@ class NetworkTrainer:
 
             accelerator.unwrap_model(network).on_epoch_start(transformer)
 
-            for step, batch in enumerate(train_dataloader):
+            skip_batches = batches_to_skip if epoch == epoch_to_start else 0
+            # TODO: Persist sampler/dataloader state so mid-epoch resume reproduces the exact shuffled sample order.
+            epoch_dataloader = (
+                accelerator.skip_first_batches(train_dataloader, num_batches=skip_batches)
+                if skip_batches
+                else train_dataloader
+            )
+            for resumed_step, batch in enumerate(epoch_dataloader):
+                step = skip_batches + resumed_step
                 # torch.compiler.cudagraph_mark_step_begin() # for cudagraphs
 
                 rescale_update_logs = {}
@@ -2226,6 +2271,9 @@ class NetworkTrainer:
                         progress_bar.reset()  # exclude first step from progress bar, because it may take long due to initializations
                     progress_bar.update(1)
                     global_step += 1
+                    training_progress.global_step = global_step
+                    training_progress.completed_epochs = epoch
+                    training_progress.step_in_epoch = step + 1
 
                     # to avoid calling optimizer_eval_fn() too frequently, we call it only when we need to sample images or save the model
                     should_sampling = should_sample_images(args, global_step, epoch=None)
@@ -2243,7 +2291,9 @@ class NetworkTrainer:
                                 save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch)
 
                                 if args.save_state:
-                                    train_utils.save_and_remove_state_stepwise(args, accelerator, global_step)
+                                    train_utils.save_and_remove_state_stepwise(
+                                        args, accelerator, global_step, training_progress
+                                    )
 
                                 remove_step_no = train_utils.get_remove_step_no(args, global_step)
                                 if remove_step_no is not None:
@@ -2272,6 +2322,10 @@ class NetworkTrainer:
                 if global_step >= args.max_train_steps:
                     break
 
+            if training_progress.step_in_epoch >= len(train_dataloader):
+                training_progress.completed_epochs = epoch + 1
+                training_progress.step_in_epoch = 0
+
             if len(accelerator.trackers) > 0:
                 logs = {"loss/epoch": loss_recorder.moving_average}
                 accelerator.log(logs, step=epoch + 1)
@@ -2292,7 +2346,9 @@ class NetworkTrainer:
                         remove_model(remove_ckpt_name)
 
                     if args.save_state:
-                        train_utils.save_and_remove_state_on_epoch_end(args, accelerator, epoch + 1)
+                        train_utils.save_and_remove_state_on_epoch_end(
+                            args, accelerator, epoch + 1, training_progress
+                        )
 
             _do_sample(epoch + 1, global_step)
             optimizer_train_fn()
@@ -2309,7 +2365,7 @@ class NetworkTrainer:
         optimizer_eval_fn()
 
         if is_main_process and (args.save_state or args.save_state_on_train_end):
-            train_utils.save_state_on_train_end(args, accelerator)
+            train_utils.save_state_on_train_end(args, accelerator, training_progress)
 
         if is_main_process:
             ckpt_name = train_utils.get_last_ckpt_name(args.output_name)

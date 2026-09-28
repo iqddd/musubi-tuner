@@ -1,13 +1,16 @@
+from argparse import ArgumentParser
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
 
 import musubi_tuner.krea2.krea2_mmdit as mmdit
+import musubi_tuner.krea2.output_preservation as preservation_module
 from musubi_tuner.krea2.alpha_token_mask import align_alpha_mask_to_token_grid
 from musubi_tuner.krea2.output_preservation import (
-    base_model_teacher, branch_loss, prepare_branch, process_preservation_batch,
+    base_model_teacher, branch_loss, get_output_preservation_loss_balance, prepare_branch, process_preservation_batch,
     validate_output_preservation_args,
 )
 from musubi_tuner.networks.lora_krea2 import create_arch_network
@@ -214,10 +217,51 @@ def test_cli_preservation_restrictions(overrides, error):
 
 
 def test_preservation_cli_default():
-    from argparse import ArgumentParser
     from musubi_tuner.krea2_train_network import krea2_setup_parser
+
     parser = krea2_setup_parser(ArgumentParser())
-    assert parser.parse_args([]).alpha_masked_output_preservation is False
+    parsed = parser.parse_args([])
+    assert parsed.alpha_masked_output_preservation is False
+    assert parsed.alpha_masked_output_preservation_loss_balance == 0.0
+
+
+@pytest.mark.parametrize("balance", [-1.0, 0.0, 1.0])
+def test_preservation_loss_balance_accepts_closed_interval(balance):
+    opts = SimpleNamespace(alpha_masked_output_preservation_loss_balance=balance)
+    assert get_output_preservation_loss_balance(opts) == balance
+
+
+@pytest.mark.parametrize("balance", [-1.01, 1.01, float("-inf"), float("inf"), float("nan")])
+def test_preservation_loss_balance_rejects_invalid_values(balance):
+    opts = SimpleNamespace(alpha_masked_output_preservation_loss_balance=balance)
+    with pytest.raises(ValueError, match=r"finite and in \[-1, 1\]"):
+        get_output_preservation_loss_balance(opts)
+
+
+def test_preservation_loss_balance_weights_losses_and_gradients():
+    model, network = model_and_network()
+    batch, latents, noise = fixtures(mixed=True)
+    parts = []
+    real_loss = branch_loss
+
+    def record(*a, **kw):
+        loss = real_loss(*a, **kw)
+        parts.append(loss)
+        return loss
+
+    opts = args()
+    opts.alpha_masked_output_preservation_loss_balance = 0.25
+    with patch.object(preservation_module, "branch_loss", record):
+        loss, metrics = process_preservation_batch(Trainer(), opts, accelerator(), model, network,
+                                                   batch, latents, noise, None, torch.float32, torch.float32)
+    parameters = tuple(network.parameters())
+    grad_target = torch.autograd.grad(parts[0], parameters, retain_graph=True)
+    grad_preservation = torch.autograd.grad(parts[1], parameters, retain_graph=True)
+    loss.backward()
+    torch.testing.assert_close(loss.detach(), 1.25 * metrics["loss_target"] + 0.75 * metrics["loss_preservation"])
+    for target, preservation, parameter in zip(grad_target, grad_preservation, parameters):
+        torch.testing.assert_close(parameter.grad, 1.25 * target + 0.75 * preservation,
+                                   atol=2e-7, rtol=2e-5)
 
 
 def test_bf16_autocast_teacher_does_not_detach_student_weights():
@@ -262,8 +306,6 @@ def test_combined_backward_equals_sum_of_branch_gradients(checkpointing):
     if checkpointing:
         model.enable_gradient_checkpointing()
     batch, latents, noise = fixtures(mixed=True)
-    import musubi_tuner.krea2.output_preservation as preservation_module
-    from unittest.mock import patch
     parts = []
     real_loss = branch_loss
 

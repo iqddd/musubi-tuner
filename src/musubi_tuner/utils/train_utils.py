@@ -1,7 +1,10 @@
 import argparse
+import json
 import logging
+import math
 import os
 import shutil
+from dataclasses import asdict, dataclass
 from typing import Callable
 
 import accelerate
@@ -22,6 +25,103 @@ LAST_STATE_NAME = "{}-state"
 STEP_STATE_NAME = "{}-step{:08d}-state"
 STEP_FILE_NAME = "{}-step{:08d}"
 STEP_DIFFUSERS_DIR_NAME = "{}-step{:08d}"
+TRAINING_PROGRESS_FILE_NAME = "training_progress.json"
+TRAINING_PROGRESS_VERSION = 1
+
+
+@dataclass
+class TrainingProgress:
+    global_step: int
+    completed_epochs: int
+    step_in_epoch: int
+    num_batches_per_epoch: int
+    gradient_accumulation_steps: int
+    version: int = TRAINING_PROGRESS_VERSION
+
+    def __post_init__(self):
+        for name in (
+            "global_step",
+            "completed_epochs",
+            "step_in_epoch",
+            "num_batches_per_epoch",
+            "gradient_accumulation_steps",
+            "version",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"training progress {name} must be an integer, got {value!r}")
+        if self.version != TRAINING_PROGRESS_VERSION:
+            raise ValueError(f"unsupported training progress version {self.version}; expected {TRAINING_PROGRESS_VERSION}")
+        if self.global_step < 0 or self.completed_epochs < 0 or self.step_in_epoch < 0:
+            raise ValueError("training progress values must be non-negative")
+        if self.num_batches_per_epoch <= 0 or self.gradient_accumulation_steps <= 0:
+            raise ValueError("training progress batch counts must be positive")
+        if self.step_in_epoch > self.num_batches_per_epoch:
+            raise ValueError("training progress step_in_epoch exceeds num_batches_per_epoch")
+
+    def resolve_resume_position(
+        self,
+        *,
+        num_batches_per_epoch: int,
+        gradient_accumulation_steps: int,
+        max_train_steps: int,
+    ) -> tuple[int, int]:
+        if self.num_batches_per_epoch != num_batches_per_epoch:
+            raise ValueError(
+                "training progress was saved with "
+                f"{self.num_batches_per_epoch} batches per epoch, but the current dataloader has "
+                f"{num_batches_per_epoch}"
+            )
+        if self.gradient_accumulation_steps != gradient_accumulation_steps:
+            raise ValueError(
+                "training progress was saved with gradient_accumulation_steps="
+                f"{self.gradient_accumulation_steps}, but the current value is {gradient_accumulation_steps}"
+            )
+
+        updates_per_epoch = math.ceil(num_batches_per_epoch / gradient_accumulation_steps)
+        expected_global_step = self.completed_epochs * updates_per_epoch
+        expected_global_step += math.ceil(self.step_in_epoch / gradient_accumulation_steps)
+        if self.global_step != expected_global_step:
+            raise ValueError(
+                f"training progress global_step={self.global_step} is inconsistent with completed_epochs="
+                f"{self.completed_epochs} and step_in_epoch={self.step_in_epoch}; expected {expected_global_step}"
+            )
+        if self.global_step > max_train_steps:
+            raise ValueError(f"training progress global_step={self.global_step} exceeds max_train_steps={max_train_steps}")
+
+        epoch_to_start = self.completed_epochs
+        batches_to_skip = self.step_in_epoch
+        if batches_to_skip == num_batches_per_epoch:
+            epoch_to_start += 1
+            batches_to_skip = 0
+        return epoch_to_start, batches_to_skip
+
+
+def save_training_progress(state_dir: str, training_progress: TrainingProgress) -> None:
+    os.makedirs(state_dir, exist_ok=True)
+    path = os.path.join(state_dir, TRAINING_PROGRESS_FILE_NAME)
+    temporary_path = path + ".tmp"
+    with open(temporary_path, "w", encoding="utf-8") as file:
+        json.dump(asdict(training_progress), file, indent=2, sort_keys=True)
+        file.write("\n")
+    os.replace(temporary_path, path)
+
+
+def load_training_progress(state_dir: str) -> TrainingProgress:
+    path = os.path.join(state_dir, TRAINING_PROGRESS_FILE_NAME)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"Resume state is missing {TRAINING_PROGRESS_FILE_NAME}: {path}. "
+            "This checkpoint cannot restore the training position."
+        )
+    with open(path, encoding="utf-8") as file:
+        payload = json.load(file)
+    if not isinstance(payload, dict):
+        raise ValueError(f"{path} must contain a JSON object")
+    try:
+        return TrainingProgress(**payload)
+    except TypeError as error:
+        raise ValueError(f"Invalid training progress in {path}: {error}") from error
 
 
 def get_sanitized_config_or_none(args: argparse.Namespace):
@@ -161,7 +261,12 @@ def get_remove_step_no(args: argparse.Namespace, step_no: int):
     return remove_step_no
 
 
-def save_and_remove_state_on_epoch_end(args: argparse.Namespace, accelerator: accelerate.Accelerator, epoch_no: int):
+def save_and_remove_state_on_epoch_end(
+    args: argparse.Namespace,
+    accelerator: accelerate.Accelerator,
+    epoch_no: int,
+    training_progress: TrainingProgress | None = None,
+):
     model_name = args.output_name
 
     logger.info("")
@@ -170,6 +275,8 @@ def save_and_remove_state_on_epoch_end(args: argparse.Namespace, accelerator: ac
 
     state_dir = os.path.join(args.output_dir, EPOCH_STATE_NAME.format(model_name, epoch_no))
     accelerator.save_state(state_dir)
+    if training_progress is not None:
+        save_training_progress(state_dir, training_progress)
     if args.save_state_to_huggingface:
         logger.info("uploading state to huggingface.")
         huggingface_utils.upload(args, state_dir, "/" + EPOCH_STATE_NAME.format(model_name, epoch_no))
@@ -183,7 +290,12 @@ def save_and_remove_state_on_epoch_end(args: argparse.Namespace, accelerator: ac
             shutil.rmtree(state_dir_old)
 
 
-def save_and_remove_state_stepwise(args: argparse.Namespace, accelerator: accelerate.Accelerator, step_no: int):
+def save_and_remove_state_stepwise(
+    args: argparse.Namespace,
+    accelerator: accelerate.Accelerator,
+    step_no: int,
+    training_progress: TrainingProgress | None = None,
+):
     model_name = args.output_name
 
     logger.info("")
@@ -192,6 +304,8 @@ def save_and_remove_state_stepwise(args: argparse.Namespace, accelerator: accele
 
     state_dir = os.path.join(args.output_dir, STEP_STATE_NAME.format(model_name, step_no))
     accelerator.save_state(state_dir)
+    if training_progress is not None:
+        save_training_progress(state_dir, training_progress)
     if args.save_state_to_huggingface:
         logger.info("uploading state to huggingface.")
         huggingface_utils.upload(args, state_dir, "/" + STEP_STATE_NAME.format(model_name, step_no))
@@ -209,7 +323,11 @@ def save_and_remove_state_stepwise(args: argparse.Namespace, accelerator: accele
                 shutil.rmtree(state_dir_old)
 
 
-def save_state_on_train_end(args: argparse.Namespace, accelerator: accelerate.Accelerator):
+def save_state_on_train_end(
+    args: argparse.Namespace,
+    accelerator: accelerate.Accelerator,
+    training_progress: TrainingProgress | None = None,
+):
     model_name = args.output_name
 
     logger.info("")
@@ -218,6 +336,8 @@ def save_state_on_train_end(args: argparse.Namespace, accelerator: accelerate.Ac
 
     state_dir = os.path.join(args.output_dir, LAST_STATE_NAME.format(model_name))
     accelerator.save_state(state_dir)
+    if training_progress is not None:
+        save_training_progress(state_dir, training_progress)
 
     if args.save_state_to_huggingface:
         logger.info("uploading last state to huggingface.")

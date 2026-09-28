@@ -779,6 +779,13 @@ def krea2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
         "Requires --alpha_masked_token_drop and standard Krea2 LoRA; block swap is not supported.",
     )
     parser.add_argument(
+        "--alpha_masked_output_preservation_loss_balance",
+        type=float,
+        default=0.0,
+        help="Balance output-preservation losses as (1+k)*target_loss + (1-k)*preservation_loss "
+        "(default: 0).",
+    )
+    parser.add_argument(
         "--alpha_masked_attention_mode",
         type=str,
         default="native",

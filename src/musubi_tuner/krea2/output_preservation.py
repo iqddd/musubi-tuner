@@ -1,5 +1,6 @@
 """Complementary masked output preservation with sequential student backwards."""
 
+import math
 from contextlib import contextmanager
 from dataclasses import dataclass
 
@@ -12,9 +13,17 @@ from musubi_tuner.krea2.packed_alpha_plan import prepare_packed_alpha_plan
 from musubi_tuner.training.timesteps import compute_loss_weighting_for_sd3
 
 
+def get_output_preservation_loss_balance(args):
+    balance = float(getattr(args, "alpha_masked_output_preservation_loss_balance", 0.0))
+    if not math.isfinite(balance) or not -1.0 <= balance <= 1.0:
+        raise ValueError("--alpha_masked_output_preservation_loss_balance must be finite and in [-1, 1]")
+    return balance
+
+
 def validate_output_preservation_args(args):
     if not getattr(args, "alpha_masked_output_preservation", False):
         return
+    get_output_preservation_loss_balance(args)
     if not getattr(args, "alpha_masked_token_drop", False):
         raise ValueError("--alpha_masked_output_preservation requires --alpha_masked_token_drop")
     if getattr(args, "blocks_to_swap", 0):
@@ -108,6 +117,9 @@ def process_preservation_batch(trainer, args, accelerator, transformer, network,
     Without it, return a differentiable combined loss for numerical diagnostics.
     """
     device, patch = accelerator.device, transformer.config.patch
+    loss_balance = get_output_preservation_loss_balance(args)
+    target_loss_weight = 1.0 + loss_balance
+    preservation_loss_weight = 1.0 - loss_balance
     mixed = isinstance(latents, list)
     preset = batch.get("timesteps")
     if mixed:
@@ -191,7 +203,7 @@ def process_preservation_batch(trainer, args, accelerator, transformer, network,
         if backward is not None:
             # Leave autocast before backward, so the next student cannot reuse a
             # cached trainable-weight cast whose graph has already been freed.
-            backward(loss_target)
+            backward(target_loss_weight * loss_target)
             loss_target = loss_target.detach()
             del prediction
         # Keep the two student cast graphs independent even under an enclosing
@@ -203,9 +215,9 @@ def process_preservation_batch(trainer, args, accelerator, transformer, network,
             loss_preservation = branch_loss(prediction, teacher, preservation, weights, network_dtype,
                                             targets_selected=True)
         if backward is not None:
-            backward(loss_preservation)
+            backward(preservation_loss_weight * loss_preservation)
             loss_preservation = loss_preservation.detach()
             del prediction
-    return loss_target + loss_preservation, {
+    return target_loss_weight * loss_target + preservation_loss_weight * loss_preservation, {
         "loss_target": loss_target.detach(), "loss_preservation": loss_preservation.detach(),
     }

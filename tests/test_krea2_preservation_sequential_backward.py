@@ -22,6 +22,7 @@ class FixedTrainer(Krea2NetworkTrainer):
         self.calls = 0
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("mode", ["native", "sharedkv", "logbias"])
 @pytest.mark.parametrize("bf16", [False, True])
 def test_accumulated_gradients_and_adamw_updates_match_combined_loss(monkeypatch, mode, bf16):
@@ -42,6 +43,7 @@ def test_accumulated_gradients_and_adamw_updates_match_combined_loss(monkeypatch
     batch["loss_multiplier"] = 2.5
     args = SimpleNamespace(
         alpha_masked_output_preservation=True,
+        alpha_masked_output_preservation_loss_balance=0.25,
         alpha_masked_attention_mode=mode,
         alpha_masked_attention_gamma=3.0,
         weighting_scheme="none",
@@ -94,7 +96,9 @@ def test_accumulated_gradients_and_adamw_updates_match_combined_loss(monkeypatch
                     microstep // 2,
                 )
             assert not loss.requires_grad
-            torch.testing.assert_close(loss, 2.5 * (metrics["loss_target"] + metrics["loss_preservation"]))
+            torch.testing.assert_close(
+                loss, 2.5 * (1.25 * metrics["loss_target"] + 0.75 * metrics["loss_preservation"])
+            )
             losses.append(loss)
             rng_states.append(torch.get_rng_state().clone())
             if microstep % 2:
