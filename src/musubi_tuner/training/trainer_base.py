@@ -1246,6 +1246,24 @@ class NetworkTrainer:
         output = self.call_dit(args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype)
         return self.compute_loss(args, output, timesteps, noise_scheduler, dit_dtype, network_dtype, global_step, batch)
 
+    def process_batch_and_backward(
+        self, args, accelerator, transformer, network, batch, latents, noise,
+        noise_scheduler, dit_dtype, network_dtype, vae, global_step,
+    ):
+        """Compute and backpropagate a microbatch before the shared optimizer step.
+
+        Architectures with independent loss branches may override this to release
+        one graph before building the next. Apply dataset weighting and use
+        accelerator.backward for every branch to preserve accumulation/scaling.
+        """
+        loss, metrics = self.process_batch(
+            args, accelerator, transformer, network, batch, latents, noise,
+            noise_scheduler, dit_dtype, network_dtype, vae, global_step,
+        )
+        loss = self.apply_dataset_loss_multiplier(loss, batch)
+        accelerator.backward(loss)
+        return loss.detach(), metrics
+
     def prepare_latents_and_noise(self, batch: dict):
         """Prepare a training microbatch; architectures may support ragged latents."""
         latents = self.scale_shift_latents(batch["latents"])
@@ -2155,7 +2173,7 @@ class NetworkTrainer:
 
                     latents, noise = self.prepare_latents_and_noise(batch)
 
-                    loss, loss_metrics = self.process_batch(
+                    loss, loss_metrics = self.process_batch_and_backward(
                         args,
                         accelerator,
                         transformer,
@@ -2170,9 +2188,6 @@ class NetworkTrainer:
                         global_step,
                     )
 
-                    loss = self.apply_dataset_loss_multiplier(loss, batch)
-
-                    accelerator.backward(loss)
                     if accelerator.sync_gradients:
                         # self.all_reduce_network(accelerator, network)  # sync DDP grad manually
                         state = accelerate.PartialState()

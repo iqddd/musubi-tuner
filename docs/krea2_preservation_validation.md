@@ -1,7 +1,8 @@
 # Krea2 preservation numerical validation (2026-09-28)
 
-No optimizer steps or training A/B were performed. This report concerns numerical
-consistency, not preservation quality or suppression of artifacts.
+The original numerical study below performed no optimizer steps or training A/B.
+The subsequent memory regression check at the end includes disposable optimizer
+updates. Neither evaluates preservation quality or suppression of artifacts.
 
 ## Reproduction
 
@@ -189,3 +190,50 @@ thresholds and the installed alpha kernel still has nondeterministic backward;
 neither result is concealed by the passing isolated control. The default training
 backend and installed wheel remain unchanged. Training-quality/visual A/B is the
 remaining evaluation and has not been run.
+
+## Sequential backward memory regression
+
+The previous training schedule retained both student graphs until a combined
+backward. A short run using `/workspace/config_krea2.toml` reproduced CUDA OOM
+after the first AdamW update, even with `PYTORCH_ALLOC_CONF=expandable_segments:True`.
+The optimizer adds 0.874 GiB of state that the earlier numerical probes omitted.
+
+Training now backpropagates the target loss before constructing the preservation
+student graph. Both contributions use the same dataset multiplier and Accelerator
+accumulation scaling; gradient reduction, clipping and the optimizer update remain
+after both contributions. Autocast weight caches are cleared between students so
+an enclosing autocast scope cannot share an already-consumed cast graph. The
+combined-loss entry point remains available for numerical diagnostics.
+
+The real-model comparison used scaled FP8, BF16, rank/alpha 32, Inductor default
+with dynamic=None, checkpointing, logbias gamma=3, batch size 2, accumulation 2,
+AdamW and the current 108-item diamel dataset. Base weights were merged with the
+configured multiplier 1.0. Sampling, trackers and checkpoint writes were disabled;
+the model, adapter and configuration files were not modified by the probe.
+
+| Schedule | Result | Peak PyTorch allocated memory |
+|---|---|---:|
+| Combined backward | OOM in microbatch 4, after one optimizer update | 30.399 GiB before failed allocation |
+| Sequential backwards | 6 microbatches / 3 optimizer updates completed | 25.068 GiB |
+
+The first matched microbatch fell from 29.787 to 24.247 GiB. These are tensor
+allocation peaks, excluding allocator reservations and non-PyTorch GPU memory.
+The short run verifies this reproduced OOM, not every bucket or sampling cycle.
+Reports are retained at
+`/workspace/alpha_diagnostics/preservation_memory_combined_20260928/report.json`
+and `/workspace/alpha_diagnostics/preservation_memory_sequential_20260928/report.json`.
+
+Reproduce each schedule in a separate process with a fresh output directory:
+
+```bash
+PYTORCH_ALLOC_CONF=expandable_segments:True .venv/bin/python \
+  tests/krea2_preservation_memory_probe.py \
+  --config /workspace/config_krea2.toml --output /workspace/alpha_diagnostics/new_memory_run
+# Add --combined for the former schedule; default length is 3 optimizer steps.
+```
+
+CPU regression tests compare combined and sequential losses, accumulated gradients,
+AdamW moments and updated parameters across native/sharedkv/logbias in FP32/BF16,
+with checkpointing, mixed resolutions and a non-unit dataset multiplier. They also
+cover empty branches and the shared trainer's default backward hook. The Krea2,
+alpha-loss and dataset-multiplier suite passes: 125 tests.

@@ -140,6 +140,25 @@ class Krea2NetworkTrainer(NetworkTrainer):
             noise_scheduler, dit_dtype, network_dtype, vae, global_step
         )
 
+    def process_batch_and_backward(
+        self, args, accelerator, transformer, network, batch, latents, noise,
+        noise_scheduler, dit_dtype, network_dtype, vae, global_step,
+    ):
+        if not getattr(args, "alpha_masked_output_preservation", False):
+            return super().process_batch_and_backward(
+                args, accelerator, transformer, network, batch, latents, noise,
+                noise_scheduler, dit_dtype, network_dtype, vae, global_step,
+            )
+
+        def backward(loss):
+            accelerator.backward(self.apply_dataset_loss_multiplier(loss, batch))
+
+        loss, metrics = process_preservation_batch(
+            self, args, accelerator, transformer, network, batch, latents, noise,
+            noise_scheduler, dit_dtype, network_dtype, backward=backward,
+        )
+        return self.apply_dataset_loss_multiplier(loss, batch), metrics
+
     # region model specific
 
     @property

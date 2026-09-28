@@ -1,4 +1,4 @@
-"""Complementary masked output preservation; no changes to the shared train loop."""
+"""Complementary masked output preservation with sequential student backwards."""
 
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -101,8 +101,12 @@ def branch_loss(prediction, targets, branch, timestep_weights, network_dtype, *,
 
 
 def process_preservation_batch(trainer, args, accelerator, transformer, network, batch, latents, noise,
-                               noise_scheduler, dit_dtype, network_dtype):
-    """Teacher first, then two student graphs and a single combined backward upstream."""
+                               noise_scheduler, dit_dtype, network_dtype, *, backward=None):
+    """Reuse one teacher target, optionally backpropagating each student immediately.
+
+    Training supplies ``backward`` to keep only one student graph alive at a time.
+    Without it, return a differentiable combined loss for numerical diagnostics.
+    """
     device, patch = accelerator.device, transformer.config.patch
     mixed = isinstance(latents, list)
     preset = batch.get("timesteps")
@@ -178,16 +182,30 @@ def process_preservation_batch(trainer, args, accelerator, transformer, network,
             with accelerator.autocast():
                 teacher = transformer(**preservation.kwargs).detach()
         torch.clear_autocast_cache()  # Also safe when a caller owns an outer autocast scope.
-    with accelerator.autocast():
-        loss_target = torch.zeros((), device=device)
-        loss_preservation = torch.zeros((), device=device)
-        if primary is not None:
+    loss_target = torch.zeros((), device=device)
+    loss_preservation = torch.zeros((), device=device)
+    if primary is not None:
+        with accelerator.autocast():
             prediction = transformer(**primary.kwargs)
             loss_target = branch_loss(prediction, targets, primary, weights, network_dtype)
-        if preservation is not None:
+        if backward is not None:
+            # Leave autocast before backward, so the next student cannot reuse a
+            # cached trainable-weight cast whose graph has already been freed.
+            backward(loss_target)
+            loss_target = loss_target.detach()
+            del prediction
+        # Keep the two student cast graphs independent even under an enclosing
+        # autocast scope (also in the combined-loss diagnostic reference).
+        torch.clear_autocast_cache()
+    if preservation is not None:
+        with accelerator.autocast():
             prediction = transformer(**preservation.kwargs)
             loss_preservation = branch_loss(prediction, teacher, preservation, weights, network_dtype,
                                             targets_selected=True)
+        if backward is not None:
+            backward(loss_preservation)
+            loss_preservation = loss_preservation.detach()
+            del prediction
     return loss_target + loss_preservation, {
         "loss_target": loss_target.detach(), "loss_preservation": loss_preservation.detach(),
     }

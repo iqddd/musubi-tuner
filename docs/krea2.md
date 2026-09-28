@@ -232,7 +232,7 @@ loss = mean_full_latent(a * (target_student - flow_target)^2
 
 Here `a = mean(alpha/255)` per 16×16 tile; the inverse is exactly `1-a`.
 There is no area renormalization or extra factor of one half. Both terms use the
-same timestep weighting; dataset weighting is applied once to their sum.
+same timestep weighting and dataset multiplier, with no extra scaling between branches.
 Mixed-resolution losses are averaged per full image first, then across images.
 The metrics `loss_target` and `loss_preservation` report the two terms separately.
 Missing alpha means `a=1`, so no preservation passes are needed. Entire empty
@@ -247,7 +247,12 @@ base prediction, not a full-context inference prediction.
 
 Plans are built outside compiled blocks and reused during checkpointing. LoRA
 multipliers and dropout state are restored before either student forward. The
-two student losses share one backward. Compile/checkpointing are supported, but
+target student runs forward/backward before the preservation student runs
+forward/backward, releasing the first graph before building the second. Both
+backwards accumulate into the same LoRA gradients; clipping, gradient reduction
+and the optimizer step happen afterward, respecting gradient accumulation. The
+teacher is computed once without gradients. This avoids retaining two student
+graphs alongside optimizer state. Compile/checkpointing are supported, but
 scaled-FP8/BF16 Inductor gradients can differ substantially from eager, including
 without preservation. `--compile_backend aot_eager` provides a closer numerical
 reference. These differences alone do not establish a semantic or visual change;
