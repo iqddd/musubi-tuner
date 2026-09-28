@@ -11,8 +11,8 @@ LoRA-up initialized with normal std=0.005, plus a separate zero-up control.
 All 28 DiT blocks are present. Native/sharedkv use deterministic FA backward.
 The custom fa2-alpha logbias operator exposes no deterministic-backward option.
 
-The historical calibration manifest and reports from TODO.md were absent on this
-instance. The replacement manifest uses two existing alpha/text/latent cache pairs
+The historical calibration manifest and reports referenced by the handoff notes
+were absent on this instance. The replacement manifest uses two existing alpha/text/latent cache pairs
 with image sizes 768x896 and 640x1024, and 144/158 text tokens. These are new
 measurements, not exact reproductions of the historical values.
 
