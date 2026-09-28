@@ -15,7 +15,7 @@ from musubi_tuner.krea2.alpha_token_mask import align_alpha_mask_to_token_grid, 
 from musubi_tuner.utils.model_utils import remove_dtype_suffix
 
 
-def cache_token_info(path: str, drop_alpha_tokens: bool, patch: int = 2) -> tuple[tuple[int, int], int]:
+def cache_token_info(path: str, drop_alpha_tokens: bool, patch: int = 2, *, inverse=False) -> tuple[tuple[int, int], int]:
     """Read only the latent shape and, when requested, the small alpha mask."""
     with safe_open(path, framework="pt", device="cpu") as cache:
         keys = [key for key in cache.keys() if remove_dtype_suffix(key).startswith("latents_")]
@@ -27,9 +27,11 @@ def cache_token_info(path: str, drop_alpha_tokens: bool, patch: int = 2) -> tupl
         h, w = shape[-2:]
         total = (h // patch) * (w // patch)
         if not drop_alpha_tokens or "alpha_mask" not in cache.keys():
-            return (h, w), total
+            return (h, w), 0 if inverse else total
         alpha = cache.get_tensor("alpha_mask").float().unsqueeze(0)
     aligned = align_alpha_mask_to_token_grid(alpha, (h, w), patch)
+    if inverse:
+        aligned = 1 - aligned
     kept = make_alpha_token_keep_mask(aligned, (h, w), patch, torch.device("cpu"))
     return (h, w), int(kept.sum().item())
 
@@ -47,6 +49,7 @@ class Krea2TokenBucketBatchManager(BucketBatchManager):
         self.multiple = multiple
         self.width = multiple * 256
         self.dry = dry
+        self.drop_alpha_tokens = drop_alpha_tokens
         self.items = [item for bucket in bucketed_item_info.values() for item in bucket]
         self.token_info = {}
         for item in self.items:
@@ -161,6 +164,15 @@ class Krea2TokenBucketBatchManager(BucketBatchManager):
               f"full batches={len(self.batch_items)} remainder={len(self.remainder)}")
         print(f"  image padding={image_padding}/{capacity} ({image_padding / capacity:.2%})" if capacity else
               "  image padding=0/0")
+        if self.drop_alpha_tokens:
+            inverse_counts = {path: cache_token_info(path, True, inverse=True)[1] for path in self.token_info}
+            inverse_lengths = [inverse_counts[item.latent_cache_path] for item in self.items]
+            inverse_capacity = sum(len(batch) * max(inverse_counts[item.latent_cache_path] for item in batch)
+                                   for batch in self.batch_items)
+            inverse_used = sum(inverse_counts[item.latent_cache_path] for batch in self.batch_items for item in batch)
+            print(f"  preservation image keep-count: min={min(inverse_lengths)} max={max(inverse_lengths)}; "
+                  f"image padding={inverse_capacity - inverse_used}/{inverse_capacity} "
+                  "(same target-based batches)")
         for number, batch in enumerate(self.batch_items):
             lengths = [self._keep_count(item) for item in batch]
             members = [f"{item.item_key}:{item.bucket_size}:{length}"

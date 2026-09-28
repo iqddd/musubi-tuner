@@ -8,7 +8,11 @@ from musubi_tuner.utils import train_utils
 def align_alpha_mask_to_token_grid(
     alpha_mask: torch.Tensor, latent_size: tuple[int, int], patch: int
 ) -> torch.Tensor:
-    """Exclude entire image tokens touched by exact-zero alpha, without a margin."""
+    """Broadcast the mean of *all* pixels of each image token to its loss cells.
+
+    Input caches store alpha in [0, 1]. Zeros participate in the mean; only a
+    wholly transparent token is removed. The same mean drives loss and attention.
+    """
     if alpha_mask.ndim == 4 and alpha_mask.shape[1] == 1:
         return align_alpha_mask_to_token_grid(alpha_mask[:, 0], latent_size, patch).unsqueeze(1)
     if alpha_mask.ndim != 3:
@@ -21,10 +25,11 @@ def align_alpha_mask_to_token_grid(
 
     batch_size, height, width = alpha_mask.shape
     cell = patch * 8
-    zero = (alpha_mask == 0).reshape(batch_size, height // cell, cell, width // cell, cell)
-    touched = zero.any(dim=(2, 4))
-    excluded = touched.repeat_interleave(cell, dim=1).repeat_interleave(cell, dim=2)
-    return alpha_mask.masked_fill(excluded, 0)
+    alpha_mask = alpha_mask.float()
+    if not torch.isfinite(alpha_mask).all() or torch.any((alpha_mask < 0) | (alpha_mask > 1)):
+        raise ValueError("Krea2 alpha mask must contain finite values in [0, 1]")
+    means = alpha_mask.reshape(batch_size, height // cell, cell, width // cell, cell).mean(dim=(2, 4))
+    return means.repeat_interleave(cell, dim=1).repeat_interleave(cell, dim=2)
 
 
 def make_alpha_token_keep_mask(

@@ -162,9 +162,12 @@ accelerate launch --num_cpu_threads_per_process 1 --mixed_precision bf16 src/mus
 
 ### Alpha-masked attention
 
-`--alpha_masked_token_drop` aligns exact-zero alpha outward to complete 16×16
-image-token cells. Those cells are removed from DiT attention and receive zero
-loss; positive alpha keeps its original soft MSE weight. The default
+`--alpha_masked_token_drop` averages **all** alpha pixels, including zeros, in
+each 16×16 image-token cell. This mean sets both attention alpha and the uniform
+MSE weight of its four latent cells. Only wholly transparent cells are physically
+removed. Mixed boundary cells now survive: this intentionally replaces the older
+"any zero excludes the whole cell" rule. Original-alpha caches remain valid.
+Without token-drop, the existing loss-mask behavior is unchanged. The default
 `--alpha_masked_attention_mode native` preserves the existing behavior: every
 positive-alpha token participates fully in attention.
 
@@ -210,6 +213,44 @@ for Linux x86_64, CPython 3.12, PyTorch 2.10.0+cu130, CUDA SM120, BF16,
 head_dim=128, GQA varlen attention, and no attention dropout. Install a wheel
 compatible with the actual Python/PyTorch/CUDA/GPU combination before selecting
 this mode. `native` and `sharedkv` do not depend on `fa2-alpha`.
+
+### Inverted-mask output preservation
+
+Add `--alpha_masked_output_preservation` to train with complementary masks. It
+requires `--alpha_masked_token_drop`, standard `networks.lora_krea2`, and
+`blocks_to_swap=0`. It is off by default. All three attention modes are supported;
+their existing backend and gamma requirements still apply.
+
+For the same noisy latent, timestep and caption, compute the base-model teacher
+(LoRA off, no gradient) with `1-a`, then the target student with `a` and the
+preservation student with `1-a`:
+
+```text
+loss = mean_full_latent(a * (target_student - flow_target)^2
+                     + (1-a) * (preservation_student - base_teacher)^2)
+```
+
+Here `a = mean(alpha/255)` per 16×16 tile; the inverse is exactly `1-a`.
+There is no area renormalization or extra factor of one half. Both terms use the
+same timestep weighting; dataset weighting is applied once to their sum.
+Mixed-resolution losses are averaged per full image first, then across images.
+The metrics `loss_target` and `loss_preservation` report the two terms separately.
+Missing alpha means `a=1`, so no preservation passes are needed. Entire empty
+branches are skipped; empty rows retain their weight in the batch average.
+
+In `sharedkv`, one shared uniform per image enables target K/V when `u<a` and
+preservation K/V when `u>=a`. Teacher and preservation student reuse the exact
+same packed plan. `native` keeps all positive-weight K/V; `logbias` uses
+`gamma*ln(a)` and `gamma*ln(1-a)` respectively. Zero-weight Q/K/V are physically
+removed in each branch; text is retained. The teacher is therefore a **masked**
+base prediction, not a full-context inference prediction.
+
+Plans are built outside compiled blocks and reused during checkpointing. LoRA
+multipliers and dropout state are restored before either student forward. The
+two student losses share one backward. Compile/checkpointing are supported, but
+extra teacher/student graphs and extra computation/memory are expected; there is
+no fixed overhead estimate. Sampling is unchanged. Bucketing still uses target-Q
+counts only; dry-bucketing additionally reports inverse lengths and padding.
 
 ### Image-token bucketing
 

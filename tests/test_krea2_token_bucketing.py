@@ -57,7 +57,8 @@ def test_alpha_keep_count_uses_training_snap16_and_remainder_assert(tmp_path):
     alpha[15, 15] = 0
     alpha[:16, 16:] = 1 / 255
     save_file({"latents_1x4x4_float32": torch.zeros(2, 1, 4, 4), "alpha_mask": alpha}, latent_path)
-    assert cache_token_info(str(latent_path), True) == ((4, 4), 3)
+    assert cache_token_info(str(latent_path), True) == ((4, 4), 4)
+    assert cache_token_info(str(latent_path), True, inverse=True) == ((4, 4), 2)
     assert cache_token_info(str(latent_path), False) == ((4, 4), 4)
     item = SimpleNamespace(item_key="one", bucket_size=(32, 32), latent_cache_path=str(latent_path))
     with pytest.raises(AssertionError, match="leave 1 unbatched items"):

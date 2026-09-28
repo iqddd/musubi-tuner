@@ -19,6 +19,7 @@ from torch import Tensor
 
 from musubi_tuner.krea2.alpha_token_mask import make_shared_kv_keep_mask
 from musubi_tuner.krea2.log_bias import LogBiasPlan, log_bias_flash_attention, make_log_bias_plan
+from musubi_tuner.krea2.packed_alpha_plan import PackedAlphaPlan
 from musubi_tuner.krea2.shared_kv import SharedKVPlan, make_shared_kv_plan, shared_kv_flash_attention
 from musubi_tuner.modules.attention import AttentionParams
 from musubi_tuner.modules.attention import attention as common_attention
@@ -504,6 +505,7 @@ class SingleStreamDiT(nn.Module):
         image_kv_probabilities: Tensor | None = None,
         shared_kv_uniforms: Tensor | None = None,
         log_bias_gamma: float | None = None,
+        packed_alpha_plan: PackedAlphaPlan | None = None,
     ) -> Tensor:
         img = self.first(img)
         t = self.tmlp(temb(t, self.config.tdim, device=img.device, dtype=img.dtype))
@@ -538,7 +540,19 @@ class SingleStreamDiT(nn.Module):
         packed_state = None
         shared_kv_plan = None
         log_bias_plan = None
-        if image_mask is None:
+        if packed_alpha_plan is not None:
+            if has_probabilities or has_sharedkv or has_logbias:
+                raise ValueError("A prepared alpha plan cannot be combined with dynamic alpha inputs")
+            plan = packed_alpha_plan
+            if plan.image_mask.shape != img.shape[:2] or plan.original_length != combined.shape[1]:
+                raise ValueError("Prepared alpha plan does not match image/text shapes")
+            image_mask = plan.image_mask
+            combined = plan.pack(combined)
+            pos = plan.positions
+            packed_state = (plan.valid, plan.permutation, plan.original_length)
+            attn_params = plan.attention
+            shared_kv_plan, log_bias_plan = plan.shared_kv, plan.log_bias
+        elif image_mask is None:
             # Preserve the original path exactly when token dropping is disabled.
             fulllen = combined.shape[1]
             padlen = (-fulllen) % 256
@@ -597,7 +611,7 @@ class SingleStreamDiT(nn.Module):
             if self.blocks_to_swap:
                 self.offloader.wait_for_block(index)
 
-            if self.gradient_checkpointing and self.training:
+            if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
                 combined = torch.utils.checkpoint.checkpoint(
                     block,
                     combined,

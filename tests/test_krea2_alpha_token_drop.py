@@ -55,22 +55,22 @@ def test_alpha_keep_mask_preserves_soft_positive_alpha_and_rejects_mixed_tokens(
 
 
 @pytest.mark.parametrize("frame_axis", [False, True])
-def test_snap16_excludes_only_touched_cells_and_preserves_soft_weights(frame_axis):
+def test_snap16_averages_zero_boundaries_and_preserves_soft_weights(frame_axis):
     alpha = torch.full((2, 32, 48), 1 / 255)
     alpha[0, 15, 15] = 0
     alpha[1, 16, 32] = 0
     expected = alpha.clone()
-    expected[0, :16, :16] = 0
-    expected[1, 16:, 32:] = 0
+    expected[0, :16, :16] = 1 / 256
+    expected[1, 16:, 32:] = 1 / 256
     if frame_axis:
         alpha, expected = alpha[:, None], expected[:, None]
     original = alpha.clone()
     aligned = align_alpha_mask_to_token_grid(alpha, (4, 6), 2)
-    assert torch.equal(aligned, expected)
+    torch.testing.assert_close(aligned, expected)
     assert torch.equal(alpha, original)
-    assert torch.equal(align_alpha_mask_to_token_grid(aligned, (4, 6), 2), aligned)
+    torch.testing.assert_close(align_alpha_mask_to_token_grid(aligned, (4, 6), 2), aligned)
     keep = make_alpha_token_keep_mask(aligned, (4, 6), 2, torch.device("cpu"))
-    assert keep.tolist() == [[False, True, True, True, True, True], [True, True, True, True, True, False]]
+    assert keep.all()
 
 
 @pytest.mark.parametrize("enabled,has_alpha", [(True, True), (False, True), (True, False)])
@@ -98,9 +98,9 @@ def test_trainer_shares_snap16_mask_between_loss_and_token_drop(enabled, has_alp
     )
     assert torch.equal(torch.get_rng_state(), rng_state)  # default native mode introduces no RNG
     if enabled and has_alpha:
-        assert model.image_mask.tolist() == [[False, True, True, True]]
+        assert model.image_mask.tolist() == [[True, True, True, True]]
         weights = apply_alpha_masked_loss(torch.ones_like(output.pred), batch)
-        assert torch.count_nonzero(weights[..., :2, :2]) == 0
+        torch.testing.assert_close(weights[..., :2, :2], torch.full_like(weights[..., :2, :2], 1 / 256))
         torch.testing.assert_close(weights[..., 2:, :], torch.full_like(weights[..., 2:, :], 1 / 255))
         assert torch.count_nonzero(alpha == 0) == 1  # cached input was not mutated
     else:

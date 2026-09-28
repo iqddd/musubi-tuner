@@ -42,6 +42,7 @@ from musubi_tuner.krea2.alpha_token_mask import (
 )
 from musubi_tuner.krea2.log_bias import require_fa2_alpha
 from musubi_tuner.krea2.mixed_token_batch import process_mixed_token_batch
+from musubi_tuner.krea2.output_preservation import process_preservation_batch, validate_output_preservation_args
 from musubi_tuner.krea2.token_bucketing import Krea2TokenBucketBatchManager
 from musubi_tuner.qwen_image import qwen_image_utils
 from musubi_tuner.utils import model_utils
@@ -51,6 +52,7 @@ logging.basicConfig(level=logging.INFO)
 
 
 def validate_alpha_masked_attention_args(args: argparse.Namespace) -> None:
+    validate_output_preservation_args(args)
     mode = getattr(args, "alpha_masked_attention_mode", "native")
     gamma = getattr(args, "alpha_masked_attention_gamma", None)
     if mode not in ("native", "sharedkv", "logbias"):
@@ -118,6 +120,11 @@ class Krea2NetworkTrainer(NetworkTrainer):
 
     def process_batch(self, args, accelerator, transformer, network, batch, latents, noise,
                       noise_scheduler, dit_dtype, network_dtype, vae, global_step):
+        if getattr(args, "alpha_masked_output_preservation", False):
+            return process_preservation_batch(
+                self, args, accelerator, transformer, network, batch, latents, noise,
+                noise_scheduler, dit_dtype, network_dtype,
+            )
         if isinstance(latents, list):
             return process_mixed_token_batch(
                 self, args, accelerator, transformer, batch, latents, noise,
@@ -698,9 +705,13 @@ def krea2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
     parser.add_argument(
         "--alpha_masked_token_drop",
         action="store_true",
-        help="Align exact-zero alpha regions outward to complete 16x16 image-token cells, "
-        "with no extra margin, and exclude those cells from both loss and image attention. "
-        "Positive alpha outside the excluded cells keeps its original soft loss weight.",
+        help="Average all alpha pixels in each 16x16 image-token cell for loss and attention; "
+        "physically drop only cells whose mean is exactly zero.",
+    )
+    parser.add_argument(
+        "--alpha_masked_output_preservation", action="store_true",
+        help="Train against the flow target with alpha and against the frozen base output with 1-alpha. "
+        "Requires --alpha_masked_token_drop and standard Krea2 LoRA; block swap is not supported.",
     )
     parser.add_argument(
         "--alpha_masked_attention_mode",
