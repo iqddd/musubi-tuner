@@ -1,0 +1,41 @@
+--- a/extension.cpp
++++ b/extension.cpp
+@@ -1,5 +1,6 @@
+ // Experimental FA2 2.8.3 adapter; upstream kernels retain their BSD license.
+ #include <torch/python.h>
++#include <ATen/cuda/CUDAContext.h>
+ #include <c10/cuda/CUDAGuard.h>
+ #include <c10/cuda/CUDAStream.h>
+ #include <cutlass/numeric_types.h>
+@@ -56,7 +57,7 @@
+ }
+
+ std::vector<Tensor> backward(Tensor dout, Tensor q, Tensor k, Tensor v, Tensor out,
+-                             Tensor lse, Tensor cu, Tensor bias, int maxlen) {
++                             Tensor lse, Tensor cu, Tensor bias, int maxlen, bool deterministic) {
+     validate(q,k,v,cu,bias,maxlen);
+     c10::cuda::CUDAGuard guard(q.device());
+     TORCH_CHECK(dout.sizes()==q.sizes() && dout.scalar_type()==q.scalar_type() && dout.device()==q.device() && dout.stride(2)==1);
+@@ -64,7 +65,12 @@
+     const auto t=q.size(0), h=q.size(1), hk=k.size(1), b=cu.numel()-1;
+     auto dke=h==hk?dk:at::empty({t,h,128},q.options());
+     auto dve=h==hk?dv:at::empty({t,h,128},q.options());
+-    auto accum=at::empty({t+128*b,h,128},q.options().dtype(at::kFloat));
++    // Match upstream FA2 varlen deterministic dQ allocation and split stride.
++    const auto sm = at::cuda::getDeviceProperties(q.get_device())->multiProcessorCount;
++    const auto splits = (sm + b*h - 1) / (b*h);
++    auto accum = deterministic
++        ? at::zeros({splits,t+128*b,h,128},q.options().dtype(at::kFloat))
++        : at::empty({t+128*b,h,128},q.options().dtype(at::kFloat));
+     auto dsum=at::empty({h,t+128*b},q.options().dtype(at::kFloat));
+     Flash_bwd_params p{};
+     init(p,q,k,v,out,lse,cu,bias,maxlen);
+@@ -74,6 +80,8 @@
+     p.dk_row_stride=dke.stride(0); p.dk_head_stride=dke.stride(1);
+     p.dv_row_stride=dve.stride(0); p.dv_head_stride=dve.stride(1);
+     p.dq_accum_ptr=accum.data_ptr(); p.dsoftmax_sum=dsum.data_ptr();
++    p.deterministic=deterministic;
++    p.dq_accum_split_stride=deterministic ? accum.stride(0) : 0;
+     run_mha_bwd_<cutlass::bfloat16_t,128,false>(p,c10::cuda::getCurrentCUDAStream().stream());
+     if(h!=hk) {
+         at::sum_out(dk,dke.reshape({t,hk,h/hk,128}),{2});

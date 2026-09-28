@@ -248,7 +248,12 @@ base prediction, not a full-context inference prediction.
 Plans are built outside compiled blocks and reused during checkpointing. LoRA
 multipliers and dropout state are restored before either student forward. The
 two student losses share one backward. Compile/checkpointing are supported, but
-extra teacher/student graphs and extra computation/memory are expected; there is
+scaled-FP8/BF16 Inductor gradients can differ substantially from eager, including
+without preservation. `--compile_backend aot_eager` provides a closer numerical
+reference. These differences alone do not establish a semantic or visual change;
+training-quality validation remains outstanding. See the
+[validation report](krea2_preservation_validation.md). Extra teacher/student graphs
+and extra computation/memory are expected; there is
 no fixed overhead estimate. Sampling is unchanged. Bucketing still uses target-Q
 counts only; dry-bucketing additionally reports inverse lengths and padding.
 
