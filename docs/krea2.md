@@ -243,6 +243,20 @@ loss = mean_full_latent(a * (target_student - flow_target)^2
 ```
 
 Here `a = mean(alpha/255)` per 16×16 tile; the inverse is exactly `1-a`.
+
+Add `--alpha_masked_output_preservation_extremes_only` to invert only exact
+alpha endpoints for the preservation branch. Before the 16×16 tile mean is
+computed, `0` becomes `1`, `1` becomes `0`, and every value strictly between
+them is left unchanged. The target branch continues to use the original alpha
+mask. The option requires `--alpha_masked_output_preservation`; full `1-alpha`
+inversion remains the default. Let `b` denote the resulting preservation token
+weight; thus `b=1-a` by default.
+
+The transformed preservation mask is also used for attention influence. With
+this option, `sharedkv` applies the same per-image random threshold directly to
+the target and preservation token weights. In `logbias`, the transformed token
+weight supplies the log bias. `native` does not apply alpha attention masking.
+
 There is no area renormalization or extra factor of one half. Both terms use the
 same timestep weighting and dataset multiplier; the optional loss balance above
 is the only extra scaling between branches.
@@ -251,12 +265,14 @@ The metrics `loss_target` and `loss_preservation` report the two terms separatel
 Missing alpha means `a=1`, so no preservation passes are needed. Entire empty
 branches are skipped; empty rows retain their weight in the batch average.
 
-In `sharedkv`, one shared uniform per image enables target K/V when `u<a` and
-preservation K/V when `u>=a`. Teacher and preservation student reuse the exact
-same packed plan. `native` keeps all positive-weight K/V; `logbias` uses
-`gamma*ln(a)` and `gamma*ln(1-a)` respectively. Zero-weight Q/K/V are physically
-removed in each branch; text is retained. The teacher is therefore a **masked**
-base prediction, not a full-context inference prediction.
+In default `sharedkv`, one shared uniform per image enables target K/V when
+`u<a` and preservation K/V when `u>=a`. With the extremes-only option, the
+preservation condition is instead the direct transformed-mask threshold `u<b`.
+Teacher and preservation student reuse the exact same packed plan. `native`
+keeps all positive-weight K/V; `logbias` uses `gamma*ln(a)` and `gamma*ln(b)`
+respectively. Zero-weight Q/K/V are physically removed in each branch; text is
+retained. The teacher is therefore a **masked** base prediction, not a
+full-context inference prediction.
 
 Plans are built outside compiled blocks and reused during checkpointing. LoRA
 multipliers and dropout state are restored before either student forward. The

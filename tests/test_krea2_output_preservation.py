@@ -5,17 +5,22 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from test_krea2_log_bias import _cpu_log_bias_attention
+from test_krea2_shared_kv import _cpu_plan_attention, _tiny_model
 
 import musubi_tuner.krea2.krea2_mmdit as mmdit
 import musubi_tuner.krea2.output_preservation as preservation_module
 from musubi_tuner.krea2.alpha_token_mask import align_alpha_mask_to_token_grid
 from musubi_tuner.krea2.output_preservation import (
-    base_model_teacher, branch_loss, get_output_preservation_loss_balance, prepare_branch, process_preservation_batch,
+    base_model_teacher,
+    branch_loss,
+    get_output_preservation_loss_balance,
+    make_output_preservation_probabilities,
+    prepare_branch,
+    process_preservation_batch,
     validate_output_preservation_args,
 )
 from musubi_tuner.networks.lora_krea2 import create_arch_network
-from test_krea2_log_bias import _cpu_log_bias_attention
-from test_krea2_shared_kv import _cpu_plan_attention, _tiny_model
 
 
 def model_and_network():
@@ -75,6 +80,64 @@ def test_mean_boundaries_and_complementary_loss_cells():
     aligned = align_alpha_mask_to_token_grid(alpha, (4, 4), 2)
     assert aligned[0, ::16, ::16].tolist() == [[0, 1], [0.5, 1]]
     assert torch.equal(aligned + (1 - aligned), torch.ones_like(aligned))
+
+
+def test_extremes_only_inverts_source_endpoints_before_token_cell_averaging():
+    alpha = torch.empty(32, 32)
+    alpha[:16, :16] = 0
+    alpha[:16, 16:] = 1
+    alpha[16:, :16] = 64 / 255
+    alpha[16:24, 16:] = 0
+    alpha[24:, 16:] = 64 / 255
+
+    target, preservation = make_output_preservation_probabilities(
+        alpha, (4, 4), 2, torch.device("cpu"), extremes_only=True
+    )
+
+    expected_target = torch.tensor([0, 1, 64 / 255, 32 / 255])
+    expected_preservation = torch.tensor([1, 0, 64 / 255, 0.5 + 32 / 255])
+    torch.testing.assert_close(target, expected_target)
+    torch.testing.assert_close(preservation, expected_preservation)
+
+
+def test_default_preservation_still_inverts_every_alpha_value():
+    alpha = torch.full((32, 32), 64 / 255)
+    target, preservation = make_output_preservation_probabilities(
+        alpha, (4, 4), 2, torch.device("cpu")
+    )
+    torch.testing.assert_close(preservation, 1 - target)
+
+
+@pytest.mark.parametrize("extremes_only,expected_preservation_probability,expected_keep", [
+    (False, 191 / 255, False),
+    (True, 64 / 255, True),
+])
+def test_sharedkv_applies_selected_preservation_mask(monkeypatch, extremes_only,
+                                                     expected_preservation_probability, expected_keep):
+    model, network = model_and_network()
+    batch, latents, noise = fixtures()
+    batch["alpha_mask"] = torch.full_like(batch["alpha_mask"], 64 / 255)
+    calls = []
+
+    def record_branch(*call_args):
+        calls.append((call_args[3], call_args[9]))
+
+    monkeypatch.setattr(preservation_module, "prepare_branch", record_branch)
+    monkeypatch.setattr(preservation_module.torch, "rand",
+                        lambda count, device=None: torch.full((count,), 0.2, device=device))
+    opts = args("sharedkv")
+    opts.alpha_masked_output_preservation_extremes_only = extremes_only
+    process_preservation_batch(Trainer(), opts, accelerator(), model, network,
+                               batch, latents, noise, None, torch.float32, torch.float32)
+
+    assert len(calls) == 2
+    for probability in calls[0][0]:
+        torch.testing.assert_close(probability, torch.full_like(probability, 64 / 255))
+    for probability in calls[1][0]:
+        torch.testing.assert_close(
+            probability, torch.full_like(probability, expected_preservation_probability)
+        )
+    assert all(torch.all(keep == expected_keep) for keep in calls[1][1])
 
 
 def test_teacher_restores_exact_state_even_on_exception_and_consumes_no_rng():
@@ -222,7 +285,17 @@ def test_preservation_cli_default():
     parser = krea2_setup_parser(ArgumentParser())
     parsed = parser.parse_args([])
     assert parsed.alpha_masked_output_preservation is False
+    assert parsed.alpha_masked_output_preservation_extremes_only is False
     assert parsed.alpha_masked_output_preservation_loss_balance == 0.0
+
+
+def test_preservation_extremes_only_requires_preservation():
+    opts = SimpleNamespace(
+        alpha_masked_output_preservation=False,
+        alpha_masked_output_preservation_extremes_only=True,
+    )
+    with pytest.raises(ValueError, match="extremes_only requires --alpha_masked_output_preservation"):
+        validate_output_preservation_args(opts)
 
 
 @pytest.mark.parametrize("balance", [-1.0, 0.0, 1.0])

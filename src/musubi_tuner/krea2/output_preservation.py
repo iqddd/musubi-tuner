@@ -21,7 +21,14 @@ def get_output_preservation_loss_balance(args):
 
 
 def validate_output_preservation_args(args):
-    if not getattr(args, "alpha_masked_output_preservation", False):
+    enabled = getattr(args, "alpha_masked_output_preservation", False)
+    extremes_only = getattr(args, "alpha_masked_output_preservation_extremes_only", False)
+    if extremes_only and not enabled:
+        raise ValueError(
+            "--alpha_masked_output_preservation_extremes_only requires "
+            "--alpha_masked_output_preservation"
+        )
+    if not enabled:
         return
     get_output_preservation_loss_balance(args)
     if not getattr(args, "alpha_masked_token_drop", False):
@@ -31,6 +38,32 @@ def validate_output_preservation_args(args):
     module = getattr(args, "network_module", None)
     if module not in (None, "networks.lora_krea2", "musubi_tuner.networks.lora_krea2"):
         raise ValueError("--alpha_masked_output_preservation supports the standard networks.lora_krea2 only")
+
+
+def make_output_preservation_probabilities(alpha, latent_size, patch, device, *, extremes_only=False):
+    """Return target and preservation weights for each DiT image token."""
+    h, w = latent_size
+    if alpha is None:
+        target = torch.ones((h // patch) * (w // patch), device=device)
+        return target, torch.zeros_like(target)
+    if alpha.ndim == 3 and alpha.shape[0] == 1:
+        alpha = alpha[0]
+    if alpha.ndim != 2:
+        raise ValueError(f"Krea2 output preservation expects a 2D alpha mask, got {tuple(alpha.shape)}")
+    alpha = alpha.to(device=device, dtype=torch.float32)
+
+    def token_probabilities(mask):
+        aligned = align_alpha_mask_to_token_grid(mask.unsqueeze(0), latent_size, patch)
+        # Alignment already computed the mean; do not introduce a second reduction.
+        return aligned[0, ::patch * 8, ::patch * 8].flatten()
+
+    target = token_probabilities(alpha)
+    if not extremes_only:
+        return target, 1 - target
+
+    endpoints = (alpha == 0) | (alpha == 1)
+    preservation_alpha = torch.where(endpoints, 1 - alpha, alpha)
+    return target, token_probabilities(preservation_alpha)
 
 
 @contextmanager
@@ -135,8 +168,9 @@ def process_preservation_batch(trainer, args, accelerator, transformer, network,
         )
         noisy_images = list(noisy)
 
-    images, positions, probabilities, targets = [], [], [], []
+    images, positions, probabilities, preservation_probabilities, targets = [], [], [], [], []
     alpha_batch = batch.get("alpha_mask")
+    extremes_only = getattr(args, "alpha_masked_output_preservation_extremes_only", False)
     for i, (noisy, latent, eps) in enumerate(zip(noisy_images, latents, noise)):
         if noisy.ndim != 4 or noisy.shape[1] != 1:
             raise ValueError("Krea2 output preservation expects single-frame Cx1xHxW latents")
@@ -149,15 +183,11 @@ def process_preservation_batch(trainer, args, accelerator, transformer, network,
                               torch.arange(w // patch, device=device), indexing="ij")
         positions.append(torch.stack((torch.zeros_like(y), y, x), dim=-1).reshape(-1, 3).float())
         alpha = None if alpha_batch is None else alpha_batch[i]
-        if alpha is None:
-            p = torch.ones(image.shape[0], device=device)
-        else:
-            if alpha.ndim == 3 and alpha.shape[0] == 1:
-                alpha = alpha[0]
-            aligned = align_alpha_mask_to_token_grid(alpha.to(device).unsqueeze(0), (h, w), patch)
-            # Alignment already computed the mean; do not introduce a second reduction.
-            p = aligned[0, ::patch * 8, ::patch * 8].flatten()
+        p, preservation_p = make_output_preservation_probabilities(
+            alpha, (h, w), patch, device, extremes_only=extremes_only
+        )
         probabilities.append(p)
+        preservation_probabilities.append(preservation_p)
         target = eps.to(device) - latent.to(device=device, dtype=network_dtype)
         targets.append(rearrange(target[:, 0], "c (h ph) (w pw) -> (h w) (c ph pw)", ph=patch, pw=patch))
 
@@ -167,19 +197,22 @@ def process_preservation_batch(trainer, args, accelerator, transformer, network,
         device=device, dtype=network_dtype)
     text_mask = torch.arange(max_text, device=device)[None] < torch.tensor([x.shape[0] for x in embeds], device=device)[:, None]
     timesteps = timesteps.to(device)
-    inverse = [1 - p for p in probabilities]
     mode = getattr(args, "alpha_masked_attention_mode", "native")
     gamma = getattr(args, "alpha_masked_attention_gamma", None)
-    target_kv = inverse_kv = None
+    target_kv = preservation_kv = None
     if mode == "sharedkv":
         uniforms = torch.rand(len(images), device=device)
         target_kv = [u < p for u, p in zip(uniforms, probabilities)]
-        # Use >= directly, not 1-u: preserve exact endpoints even when u == 0.
-        inverse_kv = [u >= p for u, p in zip(uniforms, probabilities)]
+        if extremes_only:
+            # Apply the transformed alpha mask through the same thresholding mechanism as the target mask.
+            preservation_kv = [u < p for u, p in zip(uniforms, preservation_probabilities)]
+        else:
+            # Preserve the existing strictly complementary decisions in the default full-inversion mode.
+            preservation_kv = [u >= p for u, p in zip(uniforms, probabilities)]
     primary = prepare_branch(transformer, images, positions, probabilities, context, text_mask,
                              timesteps, mode, gamma, target_kv)
-    preservation = prepare_branch(transformer, images, positions, inverse, context, text_mask,
-                                  timesteps, mode, gamma, inverse_kv)
+    preservation = prepare_branch(transformer, images, positions, preservation_probabilities, context, text_mask,
+                                  timesteps, mode, gamma, preservation_kv)
     weights = []
     for timestep in timesteps:
         weight = compute_loss_weighting_for_sd3(args.weighting_scheme, noise_scheduler,

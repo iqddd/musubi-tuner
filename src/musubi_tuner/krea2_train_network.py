@@ -775,8 +775,16 @@ def krea2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
     )
     parser.add_argument(
         "--alpha_masked_output_preservation", action="store_true",
-        help="Train against the flow target with alpha and against the frozen base output with 1-alpha. "
-        "Requires --alpha_masked_token_drop and standard Krea2 LoRA; block swap is not supported.",
+        help="Train against the flow target with alpha and against the frozen base output with a preservation "
+        "mask (1-alpha by default). Requires --alpha_masked_token_drop and standard Krea2 LoRA; "
+        "block swap is not supported.",
+    )
+    parser.add_argument(
+        "--alpha_masked_output_preservation_extremes_only",
+        action="store_true",
+        help="For output preservation, swap only exact alpha endpoints 0/255 (normalized 0/1) before "
+        "token-cell averaging; leave intermediate alpha values unchanged. "
+        "Requires --alpha_masked_output_preservation.",
     )
     parser.add_argument(
         "--alpha_masked_output_preservation_loss_balance",
